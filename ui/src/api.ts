@@ -1,5 +1,7 @@
 import { z } from 'zod';
 import type { Intent } from '@blueprintjs/core';
+import { newRequestId, report, requestHeader } from './report';
+import type { RequestId } from './report';
 
 const scanId = z.number().int().positive().brand<'ScanId'>();
 const feedId = z.number().int().positive().brand<'FeedId'>();
@@ -243,16 +245,62 @@ async function readJson(response: Response): Promise<unknown> {
   return body;
 }
 
-export async function get(path: string): Promise<unknown> {
-  return readJson(await fetch(path, { cache: 'no-store' }));
+/** Sends one correlated request. Failures are reported here, then rethrown unchanged for the caller's message. */
+async function request(path: string, init: RequestInit): Promise<{ body: unknown; requestId: RequestId }> {
+  const requestId = newRequestId();
+  const correlation = { request_id: requestId, path, issue_path: null, stack: null };
+  const headers = new Headers(init.headers);
+  headers.set(requestHeader, requestId);
+  let response: Response;
+  try {
+    response = await fetch(path, { ...init, headers });
+  } catch (error) {
+    report({ ...correlation, kind: 'api', message: `${errorMessage(error)} ${String(error)}`, status: null }, 'console');
+    throw error;
+  }
+  if (response.headers.get(requestHeader) !== requestId) {
+    report({ ...correlation, kind: 'api', message: 'The response did not echo its request ID.', status: response.status });
+  }
+  try {
+    return { body: await readJson(response), requestId };
+  } catch (error) {
+    report({ ...correlation, kind: 'api', message: errorMessage(error), status: response.status });
+    throw error;
+  }
+}
+
+/** Throws the original ZodError so errorMessage keeps naming the mismatched field. */
+export function parseResponse<S extends z.ZodType>(schema: S, body: unknown, from: { path: string; requestId: RequestId | null }): z.output<S> {
+  const parsed = schema.safeParse(body);
+  if (parsed.success) return parsed.data;
+  const [issue] = parsed.error.issues;
+  report({
+    kind: 'schema',
+    message: parsed.error.issues.slice(0, 5).map(each => `${issuePath(each.path) || 'response'}: ${each.message}`).join('; '),
+    request_id: from.requestId,
+    path: from.path,
+    status: null,
+    issue_path: issue ? issuePath(issue.path) : null,
+    stack: null,
+  });
+  throw parsed.error;
+}
+
+function issuePath(path: PropertyKey[]): string {
+  return path.map(String).join('.');
+}
+
+export async function get<S extends z.ZodType>(path: string, schema: S): Promise<z.output<S>> {
+  const { body, requestId } = await request(path, { cache: 'no-store' });
+  return parseResponse(schema, body, { path, requestId });
 }
 
 export async function post({ path, body }: Mutation): Promise<unknown> {
-  return readJson(await fetch(path, {
+  return (await request(path, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Wirewatch': '1' },
     body: JSON.stringify(body),
-  }));
+  })).body;
 }
 
 export function errorMessage(error: unknown): string {

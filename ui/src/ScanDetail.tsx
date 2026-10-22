@@ -100,7 +100,7 @@ export function ScanDetail({ scan, jobs, interval, codexAvailable, busy, mutate,
       const query = new URLSearchParams(scan.mode === 'live'
         ? { topic: scan.topic, mode: 'live' }
         : { topic: scan.topic, mode: 'historical', start_date: scan.start_date, end_date: scan.end_date });
-      const [feed] = discoverySchema.parse(await get(`/api/discover?${query}`)).feeds;
+      const [feed] = (await get(`/api/discover?${query}`, discoverySchema)).feeds;
       if (!feed) return setError('Discovery returned no topic search feed.');
       await act({ path: '/api/scans/update', body: { scan_id: scan.id, feed_url: feed.url } }, subscribedNotice);
     } catch (failure) {

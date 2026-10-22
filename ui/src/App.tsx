@@ -29,7 +29,7 @@ function useServerState() {
   const refresh = useCallback(async () => {
     const id = ++sequence.current;
     try {
-      const next = stateSchema.parse(await get('/api/state'));
+      const next = await get('/api/state', stateSchema);
       if (id < applied.current) return;
       applied.current = id;
       setState(next);

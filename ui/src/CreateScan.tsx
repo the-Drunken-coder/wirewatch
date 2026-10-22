@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { FormEvent } from 'react';
 import { Button, Callout, Checkbox, Classes, Dialog, FormGroup, HTMLSelect, InputGroup, SegmentedControl, TextArea } from '@blueprintjs/core';
-import { createdSchema, discoverySchema, errorMessage, get, historicalCoverage, modelBusy, splitTerms, windowFields } from './api';
+import { createdSchema, discoverySchema, errorMessage, get, historicalCoverage, modelBusy, parseResponse, splitTerms, windowFields } from './api';
 import type { Discovery, Mutate, ScanId, ScanWindow, State } from './api';
 import { RuleFields, SourceLink } from './ui';
 import type { RuleText } from './ui';
@@ -53,7 +53,7 @@ export function CreateScan({ state, busy, mutate, onClose, onCreated }: {
     }
     setDiscovering(true);
     try {
-      const result = discoverySchema.parse(await get(`/api/discover?${query}`));
+      const result = await get(`/api/discover?${query}`, discoverySchema);
       setPreview({ key: previewKey, result, selected: new Set(result.feeds.slice(0, 1).map(feed => feed.url)) });
     } catch (failure) {
       setError(errorMessage(failure));
@@ -84,13 +84,13 @@ export function CreateScan({ state, busy, mutate, onClose, onCreated }: {
         onCreated(null);
         return;
       }
-      const created = createdSchema.parse(await mutate({
+      const created = parseResponse(createdSchema, await mutate({
         path: '/api/scans',
         body: {
           ...fields,
           rules: { any_terms: splitTerms(rules.any), all_terms: splitTerms(rules.all), exclude_terms: splitTerms(rules.exclude) },
         },
-      }, period.mode === 'live' ? 'Scan created. Continuous checks started.' : 'Scan created. Historical run queued.'));
+      }, period.mode === 'live' ? 'Scan created. Continuous checks started.' : 'Scan created. Historical run queued.'), { path: '/api/scans', requestId: null });
       onCreated(created.scan_id);
     } catch (failure) {
       setError(errorMessage(failure));
