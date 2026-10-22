@@ -54,6 +54,7 @@ class TextOnly(HTMLParser):
 def plain(text: str, limit: int = 2000) -> str:
     parser = TextOnly()
     parser.feed(unescape(text))
+    parser.close()
     return " ".join(" ".join(parser.parts).split())[:limit]
 
 

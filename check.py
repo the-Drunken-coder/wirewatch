@@ -142,6 +142,14 @@ def no_op(payload, progress, **kwargs):
 
 
 def check_parsing():
+    for text in ("Verizon beats AT&T", "Talks on M&A", "Burn injury <"):
+        assert model.plain(text) == text, (text, model.plain(text))
+    edge_rss = b'''<rss><channel><item><title>Charger burn at AT&amp;T</title><link>https://example.com/burn</link><description>Burn report from a Q&amp;A</description></item></channel></rss>'''
+    edge_atom = b'''<feed xmlns="http://www.w3.org/2005/Atom"><entry><title>Charger burn at AT&amp;T</title><link href="https://example.com/burn"/><summary>Burn report from a Q&amp;A</summary></entry></feed>'''
+    for payload in (edge_rss, edge_atom):
+        article, = parse_feed(payload, "https://example.com/feed")
+        assert article.title == "Charger burn at AT&T" and article.summary == "Burn report from a Q&A"
+        assert evaluate(Rules(["burn"], [], []), article.title, article.summary).kept
     rss, atom = parse_feed(RSS, "https://example.com/rss"), parse_feed(ATOM, "https://example.com/atom")
     assert len(rss) == 2 and rss[0].summary == "Capacity expands" and rss[0].url == "https://example.com/chip"
     assert atom[0].summary == "New cell" and atom[0].published_at == "2026-01-02T00:00:00+00:00"
