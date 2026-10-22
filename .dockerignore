@@ -1,0 +1,13 @@
+**
+!Dockerfile
+!engine.py
+!model.py
+!setup_review.py
+!server.py
+!ui/
+!ui/**
+**/node_modules
+**/dist
+**/.env*
+**/auth.json
+**/.codex
