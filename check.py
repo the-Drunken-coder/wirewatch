@@ -1,5 +1,5 @@
 """Behavior checks using local HTTP feeds, temporary SQLite, and a stub model boundary."""
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime
@@ -11,6 +11,7 @@ from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
+import io
 import json
 import logging
 import sqlite3
@@ -21,7 +22,7 @@ import time
 import model
 import server
 import setup_review as review
-from diagnostics import AttemptKey
+from diagnostics import AttemptKey, Rejected
 from engine import Engine, SCHEMA
 from model import Rules, ScanWindow, Validators, discovery, evaluate, fetch_conditional, parse_feed, publication_time, query_url
 
@@ -1219,6 +1220,8 @@ def check_setup_limits(directory, base):
         if limit == "atomic":
             assert engine.state()["scans"][0]["revision"] == 1 and state["history"][-1]["actions"] == []
             assert len(state["history"]) == 1 and state["round"] == 1, "Plan completion rollback left next-round effects"
+            assert state["reviewed_count"] == state["history"][-1]["reviewed_count"] == 2
+            assert state["history"][-1]["rationale"] == "Page 1\nInspected every supplied full title, excerpt, decision and actual probe result"
         assert not Engine(engine.database, start_worker=False).run_next("model"), "Failed model work retried on restart"
     for violation in ("missing-probe", "unknown-id", "nonfinal-action", "lost-finding", "too-many-actions", "too-many-probes", "remove-all", "too-many-feeds", "other-scan", "output-bytes"):
         engine, scan_id = review_fixture(directory, base, f"schema-{violation}")
@@ -1257,6 +1260,19 @@ def check_setup_limits(directory, base):
         assert review_turn(engine, scan_id, invalid) == (2 if violation == "lost-finding" else 1)
         assert engine.setup_history(scan_id)["phase"] == "needs_attention", f"Schema violation accepted for {violation}"
         assert engine.state()["scans"][0]["revision"] == 1 and len(engine.state()["scans"][0]["feeds"]) == 1
+        if violation in ("too-many-probes", "remove-all", "too-many-feeds"):
+            run_id = engine.setup_history(scan_id)["run_id"]
+            traces = [json.loads(path.read_text()) for path in engine.traces.root.glob("*.json")]
+            record = next(item for item in traces if item["correlation"]["run_id"] == run_id)
+            details = record["error"]["details"]
+            assert record["outcome"] == "rejected" and record["stage"] == details["stage"] == "scoped_validation"
+            if violation == "too-many-probes":
+                assert details["path"] == "actions.probes" and details["expected"] == {"max_count": 6}
+                assert details["received"] == {"count": 7, "urls": [base + f"/new-{index}" for index in range(7)]}
+            else:
+                urls = [] if violation == "remove-all" else sorted([base + "/rss", *[f"https://existing.example/{index}" for index in range(20)]])
+                assert details["path"] == "actions.feeds" and details["expected"] == {"min_count": 1, "max_count": 20}
+                assert details["received"] == {"count": len(urls), "urls": urls}
 
     for initial in (False, True):
         if initial:
@@ -1289,6 +1305,182 @@ def check_setup_limits(directory, base):
         assert sum(item["calls_used"] for item in result["history"]) == 12
         with patch("engine.run_codex", side_effect=AssertionError("Review exceeded its CLI limit")):
             assert not engine.run_next("model")
+
+
+def check_setup_page_history(directory, base):
+    for failure in ("scope", "independence", "repeated-probe", "stale", "trace-failure"):
+        engine, scan_id = review_fixture(directory / f"history-{failure}", base, failure)
+        if failure == "scope":
+            seed_review_history(engine, scan_id, 800, 400)
+        if failure == "repeated-probe":
+            assert review_turn(engine, scan_id, lambda payload, progress, **kwargs:
+                review_result(payload, [review_action("probe_feed", url=base + "/atom")])) == 1
+        finding = {"id": "retained", "article_ids": [1], "probe_ids": [], "reason": "Keep the accepted evidence", "resolved": False}
+        rationales = []
+        def invalid(payload, progress, **kwargs):
+            rationale = f"Accepted page {payload['page_number']} before {failure} rejection"
+            rationales.append(f"Page {payload['page_number']}\n{rationale}")
+            actions = []
+            if payload["page_number"] == payload["page_count"]:
+                actions = [review_action("update_rules", rules={**RULES, "exclude_terms": ["factory"]})]
+                if failure == "scope":
+                    actions.append(review_action("remove_feed", url=base + "/unsubscribed"))
+                elif failure in ("repeated-probe", "stale", "trace-failure"):
+                    actions.append(review_action("probe_feed", url=base + "/atom"))
+            return {**review_result(payload, actions, findings=[finding]), "rationale": rationale}
+        original_connect = sqlite3.connect
+        interrupted = []
+        class AfterProgressCommit(sqlite3.Connection):
+            def __exit__(self, *args):
+                result = super().__exit__(*args)
+                if failure in ("stale", "trace-failure") and args[0] is None and not interrupted:
+                    row = self.execute("SELECT status,reviewed_count,total_count FROM setup_rounds ORDER BY id DESC LIMIT 1").fetchone()
+                    if row is not None and row["status"] == "running" and row["reviewed_count"] == row["total_count"]:
+                        interrupted.append(True)
+                        if failure == "stale":
+                            engine.update_scan({"scan_id": scan_id, "objective": "Manual edit after accepted page"})
+                        else:
+                            engine.traces.root.rename(engine.traces.root.with_name("retained-traces"))
+                            engine.traces.root.write_text("Trace storage unavailable after accepted page")
+                return result
+        def connect(*args, **kwargs):
+            return original_connect(*args, factory=AfterProgressCommit, **kwargs)
+        with patch("engine.sqlite3.connect", side_effect=connect):
+            calls = review_turn(engine, scan_id, invalid)
+        state = engine.setup_history(scan_id)
+        history = state["history"][-1]
+        assert calls >= (2 if failure == "scope" else 1)
+        assert state["calls_used"] == calls + int(failure == "repeated-probe")
+        assert state["phase"] == "needs_attention" and history["status"] == ("stale" if failure == "stale" else "failed")
+        if failure in ("stale", "trace-failure"):
+            assert interrupted, "Failure was not injected after accepted page commit"
+        assert state["reviewed_count"] == history["reviewed_count"] == history["total_count"]
+        assert history["rationale"] == "\n\n".join(rationales) and history["actions"] == []
+        with engine.transaction() as db:
+            retained = db.execute("SELECT findings FROM setup_rounds WHERE run_id=? AND round=?", (state["run_id"], state["round"])).fetchone()[0]
+        assert json.loads(retained) == [finding]
+        scan = engine.state()["scans"][0]
+        assert scan["revision"] == 1 and scan["rules"] == RULES and [feed["url"] for feed in scan["feeds"]] == [base + "/rss"]
+        restarted = Engine(engine.database, start_worker=False)
+        assert restarted.setup_history(scan_id) == state
+        with patch("engine.run_codex", side_effect=AssertionError("Rejected round retried")):
+            assert not restarted.run_next("model")
+
+
+def check_setup_requested_sources(directory, base):
+    malformed = ["https://news.google.com/rss/search?hl=en-US", "https://news.google.com/rss/search?q=one&q=two",
+        "https://news.google.com/rss/search?q=", "https://news.google.com/rss/search?q=after:2026-01-01"]
+    for index, url in enumerate(malformed):
+        for window in ({}, WINDOW):
+            engine = Engine(directory / f"requested-{index}-{window.get('mode', 'live')}" / "archive.sqlite3", start_worker=False)
+            requested = [url, base + "/rss"]
+            manual = engine.create_scan({"topic": "Manual", "objective": "Objective", "rules": RULES, "feed_urls": requested, **window})
+            job_id = engine.enqueue("setup", {"topic": "Model", "objective": "Objective", "feed_urls": requested, **window})
+            plan = setup_plan("Model", url)
+            plan["actions"].append({**plan["actions"][-1], "feed_url": base + "/rss"})
+            def boundary(payload, progress, **kwargs):
+                assert payload["user_feed_urls"] == requested
+                return plan
+            with patch("engine.fetch_feed", return_value=[]), patch("engine.run_codex", side_effect=boundary) as calls:
+                assert engine.run_next("model") and calls.call_count == 1
+            state = engine.state()
+            assert next(job for job in state["jobs"] if job["id"] == job_id)["status"] == "completed"
+            assert len(state["scans"]) == 2 and state["scans"][0]["id"] == manual
+            assert all({feed["url"] for feed in scan["feeds"]} == set(requested) for scan in state["scans"])
+            invented = engine.enqueue("setup", {"topic": "Invented", "objective": "Objective", "feed_urls": [base + "/rss"], **window})
+            with patch("engine.fetch_feed", return_value=[]), patch("engine.run_codex", return_value=setup_plan("Invented", url)):
+                assert engine.run_next("model")
+            assert next(job for job in engine.state()["jobs"] if job["id"] == invented)["status"] == "failed"
+            assert len(engine.state()["scans"]) == 2
+            before = engine.state()
+            rejected(lambda: engine.apply_plan(setup_plan("Audit selection", url), [{"url": url}], "audit", "Objective"), error=Rejected)
+            assert engine.state() == before
+            rules, mode = Rules.parse(RULES), ScanWindow.parse(window)
+            assert review.parse_actions([], rules, {url}, {url}, mode).feeds == {url}
+            for tool in ("add_feed", "probe_feed"):
+                rejected(lambda: review.parse_actions([review_action(tool, url=url)], rules, {url}, {url}, mode), error=Rejected)
+
+
+def check_setup_terminal_diagnostics(directory, base):
+    for failure in ("no-creation", "no-subscription", "missing-requested"):
+        engine = Engine(directory / f"terminal-{failure}" / "archive.sqlite3", start_worker=False)
+        requested = [base + "/rss", base + "/atom"]
+        job_id = engine.enqueue("setup", {"topic": failure, "objective": "Objective", "feed_urls": requested})
+        plan = setup_plan(failure, requested[0])
+        if failure == "no-creation":
+            plan["actions"] = []
+        elif failure == "no-subscription":
+            plan["actions"].pop()
+        with patch("engine.run_codex", return_value=plan) as calls:
+            assert engine.run_next("model") and calls.call_count == 1
+        state = engine.state()
+        assert state["scans"] == [] and len(state["jobs"]) == 1 and state["jobs"][0]["status"] == "failed"
+        assert not any(item["type"] in ("model_tool", "plan_applied", "model_plan") for item in state["activity"])
+        with engine.transaction() as db:
+            assert json.loads(db.execute("SELECT payload FROM jobs WHERE id=?", (job_id,)).fetchone()[0])["cli_calls_used"] == 1
+        records = [json.loads(path.read_text()) for path in engine.traces.root.glob("*.json")]
+        assert len(records) == 1
+        record = records[0]
+        details = record["error"]["details"]
+        assert record["outcome"] == "rejected" and record["stage"] == details["stage"] == "plan_validation"
+        if failure == "missing-requested":
+            assert details["path"] == "actions.subscribe_feed" and details["scan_ref"] == "new"
+            assert details["expected"] == {"count": 2, "urls": sorted(requested)}
+            assert details["received"] == {"count": 1, "urls": [requested[0]]}
+        else:
+            assert details["path"] == "actions.created_scans" and details["expected"] == {"min_count": 1, "min_subscribed_count": 1}
+            assert details["received"] == {"count": int(failure == "no-subscription"), "subscribed_count": 0,
+                "feeds": {"new": []} if failure == "no-subscription" else {}}
+
+
+def check_context_preflight(directory, base, routes):
+    expected = "Full-history context exceeds 600000 bytes. No model call or changes were made; this prototype never samples history."
+    urls = [base + f"/large-preview-{index}" for index in range(4)]
+    body = ("<rss><channel>" + "".join(f"<item><title>Story {index}</title><link>https://example.com/large/{index}</link>"
+        f"<description>{'x' * 2000}</description></item>" for index in range(550)) + "</channel></rss>").encode()
+    assert len(body) < model.MAX_FEED_BYTES
+    for url in urls:
+        routes[urlsplit(url).path] = Response(body)
+    try:
+        for kind in ("setup", "audit", "decision_audit"):
+            engine = Engine(directory / f"oversized-{kind}" / "archive.sqlite3", start_worker=False)
+            if kind != "setup":
+                create(engine, "Audit source", base + "/rss")
+                drain(engine)
+                with engine.transaction() as db:
+                    db.execute("UPDATE articles SET summary=? WHERE id=1", ("x" * 4_100_000,))
+            job_id = engine.enqueue(kind, {"topic": "Large setup", "objective": "Objective", "feed_urls": urls} if kind == "setup" else {})
+            events = io.StringIO()
+            with redirect_stderr(events), patch("engine.run_codex", side_effect=AssertionError("Oversized context spent a model call")) as calls:
+                if kind == "audit":
+                    with patch("engine.fetch_feed", return_value=[]):
+                        assert engine.run_next("model")
+                else:
+                    assert engine.run_next("model")
+            assert calls.call_count == 0 and not list(engine.traces.root.glob("*.json"))
+            state = engine.state()
+            job = next(item for item in state["jobs"] if item["id"] == job_id)
+            assert job["status"] == "failed" and job["message"] == expected
+            assert not any(json.loads(line)["event"].startswith("model_trace_") for line in events.getvalue().splitlines())
+            if kind == "setup":
+                assert state["scans"] == []
+                with engine.transaction() as db:
+                    assert json.loads(db.execute("SELECT payload FROM jobs WHERE id=?", (job_id,)).fetchone()[0]).get("cli_calls_used", 0) == 0
+            else:
+                assert state["audits"][0]["error"] == expected and state["audits"][0]["input_hash"] is None
+    finally:
+        for url in urls:
+            routes.pop(urlsplit(url).path)
+
+
+def check_first_start(directory):
+    events = io.StringIO()
+    with redirect_stderr(events):
+        engine = Engine(directory / "fresh-volume" / "archive.sqlite3", start_worker=False)
+    emitted = [json.loads(line)["event"] for line in events.getvalue().splitlines()]
+    retained = [json.loads(line)["event"] for line in (engine.events.root / "events.jsonl").read_text().splitlines()]
+    assert "app_starting" in emitted and "app_starting" in retained
+    assert "diagnostics_write_failed" not in emitted
 
 
 def check_setup_cancellation(directory, base):
@@ -1631,6 +1823,11 @@ def main():
         check_setup_sources(path, base, routes)
         check_setup_gates(path, base, routes)
         check_setup_limits(path, base)
+        check_setup_page_history(path, base)
+        check_setup_requested_sources(path, base)
+        check_setup_terminal_diagnostics(path, base)
+        check_context_preflight(path, base, routes)
+        check_first_start(path)
         check_setup_cancellation(path, base)
         check_setup_isolation(path, base, routes)
         check_setup_job_migration(path, base)
@@ -1648,7 +1845,10 @@ def main():
         "collector replay and unrelated edits during blocked setup review", "jobs CHECK migration preserves rows and indexes",
         "historical arrivals during collection reach frozen replay", "new source poll survives cancellation of old poll",
         "jobs migration exception and process crash rollback", "late lane and resumed deterministic work get bounded settling",
-        "dated Google probe canonicalization and conservative independence", "lossless dense rows six 100-item probes and exact UTF8 boundaries", *diagnostics]}))
+        "dated Google probe canonicalization and conservative independence", "lossless dense rows six 100-item probes and exact UTF8 boundaries",
+        "accepted final page history survives scoped rejection", "exact requested Google feeds match manual and model setup",
+        "terminal setup diagnostics preserve counts URLs and rollback", "oversized setup and audits refuse before tracing or spending",
+        "fresh archive retains startup without diagnostics failure", *diagnostics]}))
 
 
 if __name__ == "__main__":

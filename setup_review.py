@@ -302,9 +302,13 @@ def parse_actions(actions: list[dict[str, object]], rules: Rules, feeds: set[str
         except ValueError as exc:
             raise Rejected(str(exc), path=f"actions[{index}]{field}", expected="valid scoped setup action", received=action, stage="scoped_validation") from exc
     if not 1 <= len(desired) <= 20:
-        raise ValueError("Setup review must retain 1 to 20 subscribed feeds")
+        raise Rejected("Setup review must retain 1 to 20 subscribed feeds", path="actions.feeds",
+                       expected={"min_count": 1, "max_count": 20}, received={"count": len(desired), "urls": sorted(desired)},
+                       stage="scoped_validation")
     if len(probes) > MAX_PROBES:
-        raise ValueError("Setup review supports at most 6 pending probes")
+        raise Rejected("Setup review supports at most 6 pending probes", path="actions.probes",
+                       expected={"max_count": MAX_PROBES}, received={"count": len(probes), "urls": [probe["url"] for probe in probes]},
+                       stage="scoped_validation")
     subscribed = {source_identity(url) for url in feeds | desired}
     for probe in probes:
         probe["independent"] = probe_source(probe["url"]) not in subscribed

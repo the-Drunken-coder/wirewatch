@@ -17,7 +17,7 @@ import uuid
 
 from diagnostics import AttemptKey, Events, ModelTraces, Rejected
 from model import (MODEL_PROMPT, PLAN_SCHEMA, COLLECTION_INTERVAL_SECONDS, FeedHTTPError, Rules, ScanWindow, Validators,
-    codex_path, discovery, evaluate, feed_urls, fetch_conditional, fetch_feed, minutes, next_check_delay,
+    codex_path, codex_prompt, discovery, evaluate, feed_urls, fetch_conditional, fetch_feed, minutes, next_check_delay,
     now, publication_time, query_url, required_text, run_codex, safe_url)
 import setup_review as review
 
@@ -130,8 +130,8 @@ class Engine:
         self.database = database
         self.events = Events(database.parent)
         self.traces = ModelTraces(database.parent, self.events)
-        self.events.emit("app_starting")
         database.parent.mkdir(parents=True, exist_ok=True)
+        self.events.emit("app_starting")
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         with self.transaction() as db:
@@ -1009,20 +1009,25 @@ class Engine:
                 carry = output.findings
                 rationales.append(f"Page {number}\n{output.rationale}")
                 reviewed += sum(item["type"] == "decision" for item in page)
-                attempt.save(stage="application" if number == len(pages) else "page_accepted")
+                attempt.save(stage="page_accepted")
                 with self.transaction() as db:
                     current = self._setup_current(db, job)
                     if current is not None:
                         db.execute("UPDATE setup_runs SET reviewed_count=? WHERE run_id=?", (reviewed, job.payload["run_id"]))
                         db.execute("UPDATE setup_rounds SET reviewed_count=?,rationale=?,findings=? WHERE run_id=? AND round=? AND finished_at IS NULL",
                             (reviewed, "\n\n".join(rationales), json.dumps(carry, ensure_ascii=False), job.payload["run_id"], job.payload["round"]))
-                        if number == len(pages):
-                            current = self._setup_current(db, job)
-                            self._apply_setup_round(db, job, current, output, carry, probes, allowed, report)
                 if current is None:
                     attempt.save(stage="stale_snapshot", outcome="stale")
                     return
                 if number == len(pages):
+                    attempt.save(stage="application")
+                    with self.transaction() as db:
+                        current = self._setup_current(db, job)
+                        if current is not None:
+                            self._apply_setup_round(db, job, current, output, carry, probes, allowed, report)
+                    if current is None:
+                        attempt.save(stage="stale_snapshot", outcome="stale")
+                        return
                     attempt.committed = True
             self.events.emit("setup_page_accepted", job_id=job.id, scan_id=job.scan_id, run_id=key.run_id,
                              round=key.round, page=number, attempt_id=attempt.id, reviewed_count=reviewed)
@@ -1199,6 +1204,7 @@ class Engine:
                             db.execute("UPDATE audits SET status='failed',finished_at=?,error='Scheduled audit disabled before model execution' WHERE id=?", (now(), audit_id))
                         self._progress(db, job_id, "Scheduled audit disabled", status="cancelled", finished_at=now())
                         return
+            codex_prompt(payload)
             with self.traces.open(AttemptKey(job_id, kind, audit_id=audit_id), payload, PLAN_SCHEMA, MODEL_PROMPT) as attempt:
                 if kind == "setup":
                     with self.transaction() as db:
@@ -1309,7 +1315,8 @@ class Engine:
                             raise ValueError("Setup must use the requested custom feeds or default topic search")
                         if url not in allowed_urls:
                             raise ValueError("Model selected a feed outside the supplied discovery catalog")
-                        review.probe_source(url)
+                        if kind != "setup" or setup_urls is None:
+                            review.probe_source(url)
                         self._subscribe(db, scan_id, url)
                     elif tool == "replay_history":
                         self._enqueue(db, "replay", {"scan_id": scan_id}, "model")
@@ -1319,13 +1326,21 @@ class Engine:
                 self.activity(db, "model_tool", f"{tool}: {reason}", scan_id, {**action, **ScanWindow.parse(dict(self.scan(db, scan_id))).to_dict()})
             except ValueError as exc:
                 raise Rejected(str(exc), path=f"actions[{index}]", expected="valid authorized tool action", received=action, stage="plan_validation") from exc
-        if kind == "setup" and (not aliases or not any(db.execute("SELECT 1 FROM feeds WHERE scan_id=?", (scan_id,)).fetchone() for scan_id in aliases.values())):
-            raise ValueError("Setup must create a scan and subscribe a feed. No tools applied")
-        if kind == "setup" and setup_urls is not None:
-            for scan_id in aliases.values():
-                actual = {row["url"] for row in db.execute("SELECT url FROM feeds WHERE scan_id=?", (scan_id,))}
-                if actual != set(setup_urls):
-                    raise ValueError("Setup must subscribe all requested feeds. No tools applied")
+        if kind == "setup":
+            subscriptions = {ref: sorted(row["url"] for row in db.execute("SELECT url FROM feeds WHERE scan_id=?", (scan_id,)))
+                for ref, scan_id in aliases.items()}
+            if not subscriptions or not any(subscriptions.values()):
+                raise Rejected("Setup must create a scan and subscribe a feed. No tools applied", path="actions.created_scans",
+                               expected={"min_count": 1, "min_subscribed_count": 1},
+                               received={"count": len(aliases), "subscribed_count": sum(bool(urls) for urls in subscriptions.values()),
+                                         "feeds": subscriptions}, stage="plan_validation")
+            if setup_urls is not None:
+                requested = sorted(set(setup_urls))
+                for ref, actual in subscriptions.items():
+                    if actual != requested:
+                        raise Rejected("Setup must subscribe all requested feeds. No tools applied", path="actions.subscribe_feed",
+                                       expected={"count": len(requested), "urls": requested}, received={"count": len(actual), "urls": actual},
+                                       scan_ref=ref, scan_id=aliases[ref], stage="plan_validation")
         for scan_id in affected:
             scan = self.scan(db, scan_id)
             if scan_id in setup_hashes and setup_hashes[scan_id] != self._setup_hash(db, scan_id):
