@@ -27,13 +27,20 @@ _EVENT_LOCK = threading.RLock()
 _TRACE_LOCK = threading.RLock()
 _ACTIVE: set[Path] = set()
 _SECRET = re.compile(
-    r"(?:^|[_.-])(?:authorization|cookies?|passwords?|passwd|secrets?|credentials?|key|token|"
-    r"(?:api|access|private|signing|encryption)[_-]?key|auth|signature|sig|session[_-]?id)(?:$|[_.-])", re.I)
+    r"(?:passwords?|passwd|secrets?|credentials?|cookies?|tokens?)(?:key)?(?![a-z])|"
+    r"(?:^|[_.\s-])(?:authorization|key|(?:api|access|private|signing|encryption)[_-]?key|"
+    r"auth|signature|sig|session[_-]?id)(?:$|[_.\s-])", re.I)
 _URL = re.compile(r"https?://[^\s<>\"']+", re.I)
 _BEARER = re.compile(r"\bBearer\s+[^\s,;\"']+", re.I)
+# Failed names must not restart inside escapes and rescan the remaining text.
 _ASSIGNMENT = re.compile(
-    r'''(?:(?P<quote>\\*["'])|\\+[nrt]|(?<![\w.-]))(?P<name>(?:\\+u[0-9a-fA-F]{4}|[\w.-])+)
+    r'''(?:(?P<quote>\\{0,15}["'])|\\{1,15}[nrt]|(?<![\w.-])(?!(?<=\\)(?:\\|u[0-9a-fA-F]{4})))
+        (?P<name>(?:\\{1,15}u[0-9a-fA-F]{4}|(?(quote)[\w. \t-]|[\w.-]))+)
         (?(quote)(?P=quote))\s*[:=]\s*''', re.X)
+_OPENING_QUOTE = re.compile(r'''\\*["']''')
+_QUOTE = re.compile(r'''["']''')
+_HEADER_VALUE = re.compile(r'''(?:\\+(?![\\nrt"'])[^\r\n]|[^\r\n"'\\])*''')
+_ASSIGNMENT_VALUE = re.compile(r'''(?:\\+(?![\\nrt"'])[^\r\n]|[^\s,;{}\[\]&"'\\])*''')
 _HEADER = re.compile(r"(?<![\"'])\b(authorization|(?:set-)?cookie)\s*[:=]\s*[^\r\n]*", re.I)
 _CREDENTIAL = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b")
 
@@ -52,24 +59,28 @@ def _redact_assignments(value: str) -> str:
     for match in _ASSIGNMENT.finditer(value):
         if match.start() < end:
             continue
-        name = re.sub(r"\\+u([0-9a-fA-F]{4})", lambda item: chr(int(item[1], 16)), match["name"])
+        name = re.sub(r"\\{1,15}u([0-9a-fA-F]{4})", lambda item: chr(int(item[1], 16)), match["name"])
         if not _sensitive_name(name):
             continue
         start = match.end()
-        opening = re.match(r'''\\*["']''', value[start:])
+        opening = _OPENING_QUOTE.match(value, start)
         quote = opening[0] if opening else ""
         if quote:
             slashes = len(quote) - 1
             stop = len(value)
-            for closing in re.finditer(r'''\\*["']''', value[start + len(quote):]):
+            for closing in _QUOTE.finditer(value, opening.end()):
+                escape_start = closing.start()
+                while escape_start > opening.end() and value[escape_start - 1] == "\\":
+                    escape_start -= 1
+                escapes = closing.start() - escape_start
                 # A closing quote has the same escape level as the opening quote.
-                if closing[0][-1] == quote[-1] and (len(closing[0]) - 1) % (2 * (slashes + 1)) == slashes:
-                    stop = start + len(quote) + closing.end()
+                if closing[0] == quote[-1] and escapes % (2 * (slashes + 1)) == slashes:
+                    stop = closing.end()
                     break
         elif name.lower() in ("authorization", "cookie", "set-cookie"):
-            stop = start + re.match(r'''(?:\\+(?![\\nrt"'])[^\r\n]|[^\r\n"'\\])*''', value[start:]).end()
+            stop = _HEADER_VALUE.match(value, start).end()
         else:
-            stop = start + re.match(r'''(?:\\+(?![\\nrt"'])[^\r\n]|[^\s,;{}\[\]&"'\\])*''', value[start:]).end()
+            stop = _ASSIGNMENT_VALUE.match(value, start).end()
         if stop == start:
             continue
         parts.extend((value[end:start], quote, "[REDACTED]", quote))

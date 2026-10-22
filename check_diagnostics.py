@@ -6,13 +6,14 @@ from pathlib import Path
 from threading import Event, Thread, current_thread
 from unittest.mock import patch
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, quote_plus, unquote, urlsplit
 from urllib.request import Request, urlopen
 import json
 import os
 import re
 import sqlite3
 import stat
+import subprocess
 import sys
 import time
 
@@ -431,6 +432,94 @@ def check_identifier_redaction(directory):
     assert record["outcome"] == "validated"
 
 
+def check_compact_credentials(directory):
+    root = directory / "compact-credentials"
+    root.mkdir()
+    names = ("clientsecret", "appsecret", "apisecret", "secretkey", "SECRETKEY", "dbpassword", "PGPASSWORD",
+             "adminpassword", "password1", "password2", "user_password1", "secret2", "sessioncookie", "authcookie",
+             "accesstoken", "Client Secret", "Password Hash")
+    benign = {"stable_key": "article-visible", "topic_key": "scan-visible", "secretary": "visible-secretary"}
+    prose = "Press Secretary: Taylor said the secretary announced a new policy."
+    events = Events(root)
+    store = ModelTraces(root, events)
+    samples = []
+    with redirect_stderr(StringIO()):
+        for index, name in enumerate(names):
+            secret = f"opaque-compact-{index}-private"
+            quoted = json.dumps({name: secret, "safe": "visible-neighbor"})
+            escaped_name = "".join(f"\\u{ord(char):04x}" for char in name)
+            escaped = quoted.replace(name, escaped_name)
+            double = json.dumps(escaped)
+            message = "\n".join((f"'{name}'='{secret}'", quoted, escaped, double, json.dumps(double),
+                                 repr({name: secret}), r"\n" + quoted, prose))
+            if " " not in name:
+                message += f"\n{name}={secret}\n\\{name}={secret}"
+            sample = {"fields": {name: secret}, "message": message, "benign": benign,
+                      "source": f"https://example.com/rss?{quote_plus(name)}={secret}&q=visible"}
+            samples.append(sample)
+            events.emit("compact_credentials", **sample)
+        with store.open(AttemptKey("compact-credentials", "audit"), {"samples": samples}, {}, "") as attempt:
+            attempt.save(response={"samples": samples})
+    event_text = (events.root / "events.jsonl").read_text()
+    trace_text = attempt.path.read_text()
+    records = [json.loads(line) for line in event_text.splitlines() if json.loads(line)["event"] == "compact_credentials"]
+    trace = json.loads(trace_text)
+    assert len(records) == len(names) and trace["outcome"] == "validated"
+    for index, name in enumerate(names):
+        assert f"opaque-compact-{index}-private" not in event_text + trace_text, name
+        for sample in (records[index], trace["input"]["samples"][index], trace["response"]["samples"][index]):
+            assert sample["fields"] == {name: "[REDACTED]"}
+            assert sample["benign"] == benign and prose in sample["message"]
+            assert parse_qs(urlsplit(sample["source"]).query) == {name: ["[REDACTED]"], "q": ["visible"]}
+            assert "visible-neighbor" in sample["message"]
+
+
+def store_escape_boundaries(directory, limit):
+    root = directory / f"escape-boundaries-{limit}"
+    root.mkdir()
+    secret = "opaque-escape-private"
+    suffix = f'"{secret}"'
+    opening = "token=" + "\\" * (limit - len("token=") - len(suffix)) + suffix
+    closing = 'token="' + secret + "\\" * (limit - len('token="') - len(secret) - 1) + '"'
+    name_suffix = "token=" + secret
+    unicode_name = (r"\u0061" * ((limit - len(name_suffix)) // 6)
+                    + "a" * ((limit - len(name_suffix)) % 6) + name_suffix)
+    unicode_run = r"\u0061" * (limit // 6) + "x" * (limit % 6)
+    repeated = "token=a " * (limit // 8) + "x" * (limit % 8)
+    cases = {"slashes": "\\" * limit, "opening": opening, "closing": closing,
+             "unicode_name": unicode_name, "unicode_run": unicode_run, "repeated": repeated}
+    assert all(len(value.encode()) == limit for value in cases.values())
+    events = Events(root)
+    store = ModelTraces(root, events)
+    with redirect_stderr(StringIO()):
+        with store.open(AttemptKey(f"escape-{limit}", "audit"), {}, {}, "") as attempt:
+            attempt.save(**{name: {"text": value, "retained_bytes": limit} for name, value in cases.items()})
+        events.emit("escape_boundaries", **cases)
+    event_bytes = (events.root / "events.jsonl").read_bytes()
+    trace_bytes = attempt.path.read_bytes()
+    assert secret.encode() not in event_bytes + trace_bytes
+    record = json.loads(trace_bytes)
+    assert record["outcome"] == "validated"
+    for name in ("slashes", "unicode_run"):
+        assert record[name]["text"] == cases[name]
+    assert "token=a" not in record["repeated"]["text"] and "[REDACTED]" in record["repeated"]["text"]
+    assert all(record[name]["retained_bytes"] == limit for name in cases)
+    event_lines = event_bytes.splitlines()
+    assert all(len(line) + 1 <= diagnostics.EVENT_BYTES for line in event_lines)
+    event = next(json.loads(line) for line in event_lines if json.loads(line)["event"] == "escape_boundaries")
+    assert event["truncated"]
+
+
+def check_escape_boundaries(directory):
+    script = ("import sys; from pathlib import Path; sys.path.insert(0, sys.argv[1]); "
+              "from check_diagnostics import store_escape_boundaries; "
+              "store_escape_boundaries(Path(sys.argv[2]), int(sys.argv[3]))")
+    for limit in (diagnostics.STREAM_BYTES, diagnostics.RAW_BYTES):
+        result = subprocess.run([sys.executable, "-I", "-B", "-c", script, str(Path(__file__).resolve().parent),
+                                 str(directory), str(limit)], capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, (limit, result.stdout, result.stderr)
+
+
 def check_long_evidence(directory, base):
     root = directory / "long-evidence"
     root.mkdir()
@@ -797,6 +886,8 @@ def run(directory, base):
     check_failed_write_cleanup(root)
     check_assignment_redaction(root)
     check_identifier_redaction(root)
+    check_compact_credentials(root)
+    check_escape_boundaries(root)
     check_long_evidence(root, base)
     check_nested_url_redaction(root)
     check_cli(root)
@@ -810,4 +901,6 @@ def run(directory, base):
             "postcommit diagnostic failure preserves completed effects", "original rejection survives diagnostic failure",
             "rejected evidence paths duplicate refs and stale snapshot details", "collector independence from unavailable diagnostics",
             "HTTP IDs guards errors strict client reports and locked rate limit",
-            "long colon and equals evidence survives traces model jobs and HTTP reports"]
+            "long colon and equals evidence survives traces model jobs and HTTP reports",
+            "compact spaced and serialized credentials stay private in stored events and traces",
+            "stream and raw escape boundaries save under subprocess deadlines"]
