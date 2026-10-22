@@ -126,6 +126,8 @@ Each stream retains at most 65536 bytes and the raw plan at most 262144 bytes, w
 
 Redaction covers nested credential-shaped keys and text, authorization and cookie material, bearer tokens, URL userinfo, and sensitive URL query parameters. No code reads credential files or logs environment or request-header dumps. Ordinary events omit prompts and article bodies. Private traces still contain user objectives and news text, so they must remain local.
 
+Redaction is best effort. Assignments nested beyond five JSON serialization layers can retain credentials. Some suffix-glued names, such as `passwordhash` and `secretaccesskey`, and backslash-prefixed token assignments can also remain visible. Conservative matching can hide ports or stack-line numbers in sensitive-word host and file names. Keep diagnostic files private.
+
 Ordinary diagnostic failures emit bounded stderr emergency events and do not stop deterministic collection. Required trace writes fail closed before model spending or before subsequent validation/application. Failed reserved attempts retain their existing call count. Context finalization preserves the original exception. If final persistence fails after a real transaction commits, the completed application job stays completed and is not retried. `model_trace_outcome_unconfirmed` reports the attempt/job identity and `application_committed`; the retained file may still say pending. That status is diagnostic uncertainty and does not imply rollback. Retention deletions and failures have explicit events. The earlier discarded CPSC rejection is not recoverable from these new files.
 
 ### HTTP correlation and browser reports
