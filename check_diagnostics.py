@@ -3,7 +3,7 @@ from contextlib import contextmanager, redirect_stderr
 from http.server import ThreadingHTTPServer
 from io import StringIO
 from pathlib import Path
-from threading import Thread
+from threading import Event, Thread, current_thread
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -192,6 +192,89 @@ def check_storage(directory):
     assert fails(reject) is exception
 
 
+def check_failed_write_cleanup(directory):
+    root = directory / "failed-write-cleanup"
+    root.mkdir()
+    store = ModelTraces(root, Events(root))
+    failed = Event()
+    resume = Event()
+    finished = Event()
+    overlapping = Event()
+    results = {}
+    original_fsync, original_emergency, original_stat = os.fsync, diagnostics.emergency, Path.stat
+    failure = OSError("Controlled failed fsync")
+    attempt = diagnostics.ModelAttempt(store, AttemptKey("writer-a", "audit"))
+    temporary = attempt.path.with_suffix(".tmp")
+
+    def fsync(fd):
+        if current_thread().name == "writer-a":
+            raise failure
+        original_fsync(fd)
+
+    def emergency(event, **fields):
+        if current_thread().name == "writer-a" and event == "model_trace_write_failed":
+            failed.set()
+            assert resume.wait(5), "Concurrent prune did not start"
+        original_emergency(event, **fields)
+
+    def stat(path, *args, **kwargs):
+        if current_thread().name == "writer-b" and path == temporary and not overlapping.is_set():
+            overlapping.set()
+            resume.set()
+            # Cleanup may wait for pruning's lock, so allow pruning to finish either way.
+            finished.wait(0.2)
+        return original_stat(path, *args, **kwargs)
+
+    def writer_a():
+        try:
+            attempt.save(input={"objective": "Failed writer input"})
+        except Exception as exc:
+            results["a"] = exc
+        finally:
+            finished.set()
+
+    def writer_b():
+        try:
+            with store.open(AttemptKey("writer-b", "audit"), {"objective": "Concurrent writer input"}, {}, "") as other:
+                results["b_path"] = other.path
+        except Exception as exc:
+            results["b"] = exc
+
+    a = Thread(target=writer_a, name="writer-a")
+    b = Thread(target=writer_b, name="writer-b")
+    captured = StringIO()
+    try:
+        with redirect_stderr(captured), patch("diagnostics.os.fsync", fsync), patch("diagnostics.emergency", emergency), patch.object(Path, "stat", stat):
+            a.start()
+            assert failed.wait(5), "Failed fsync was not observed"
+            b.start()
+            a.join(5)
+            b.join(5)
+            assert not a.is_alive() and not b.is_alive(), "Concurrent writers did not finish"
+    finally:
+        resume.set()
+        for thread in (a, b):
+            if thread.ident is not None:
+                thread.join(5)
+        with diagnostics._TRACE_LOCK:
+            diagnostics._ACTIVE.discard(attempt.path)
+    assert overlapping.is_set() and results.get("a") is failure
+    assert "b" not in results, (results.get("b"), getattr(results.get("b"), "__cause__", None))
+    record = json.loads(results["b_path"].read_bytes())
+    assert record["outcome"] == "validated" and record["input"]["objective"] == "Concurrent writer input"
+    assert not list(store.root.glob("*.tmp"))
+    events = [json.loads(line) for line in captured.getvalue().splitlines()]
+    assert [event["attempt_id"] for event in events if event["event"] == "model_trace_write_failed"] == [attempt.id]
+    assert not any(event["event"] in ("model_trace_cleanup_failed", "model_trace_retention_failed") for event in events)
+    with store.open(AttemptKey("active-byte-limit", "audit"), {"objective": "x" * 600}, {}, "") as active:
+        retained = active.path.read_bytes()
+        with patch("diagnostics.TRACE_TOTAL_BYTES", len(retained) + 1):
+            rejected = fails(lambda: store.open(AttemptKey("over-limit", "audit"), {}, {}, ""), RuntimeError)
+        assert "Active model traces exceed" in str(rejected.__cause__)
+        assert active.path.read_bytes() == retained
+        assert not list(store.root.glob("*.tmp"))
+
+
 @contextmanager
 def fake_cli(directory, mode):
     path = directory / f"fake-codex-{mode}"
@@ -266,6 +349,49 @@ def check_assignment_redaction(directory):
     for stored in (record["stdin"], record["raw"]["text"], record["stderr"]["text"], event["message"]):
         assert all(name in stored for name in names) and neighbors in stored
     assert record["response"]["actions"] == [] and record["outcome"] == "validated"
+
+
+def check_identifier_redaction(directory):
+    root = directory / "identifier-redaction"
+    root.mkdir()
+    identifiers = {"stable_key": "article-visible-42", "topic_key": "scan-visible-7"}
+    names = ("key", "token", "auth", "sig", "api_key", "access-key", "privateKey", "signing_key", "encryption_key",
+             "secret_key", "tenant_api_key", "tenant-access-key", "tenant_private_key", "tenant-signing-key",
+             "tenant_encryption_key", "tenant_secret_key")
+    credentials = {name: f"opaque-credential-{index}" for index, name in enumerate(names)}
+    detail = {"identifiers": identifiers, "fields": credentials}
+    message = json.dumps({**detail, "nested": json.dumps(detail)})
+    url = "https://example.com/?stable_key=article-visible-42&topic_key=scan-visible-7&" + "&".join(
+        f"{name}={value}" for name, value in credentials.items())
+    payload = {"objective": message, **detail, "source": url,
+               "feeds": [{"stable_key": identifiers["stable_key"], "token": "opaque-feed-nonce"}]}
+    events = Events(root)
+    store = ModelTraces(root, events)
+    captured = StringIO()
+    with redirect_stderr(captured), fake_cli(root, "redaction"):
+        events.emit("identifier_redaction", message=message, **detail, source=url)
+        with store.open(AttemptKey("identifier-redaction", "audit"), payload, model.PLAN_SCHEMA, model.MODEL_PROMPT) as attempt:
+            result = model.run_codex(payload, lambda _: None, attempt=attempt)
+    assert result == {"rationale": message, "actions": []}
+    record = json.loads(attempt.path.read_bytes())
+    event = json.loads((events.root / "events.jsonl").read_bytes().splitlines()[0])
+    artifacts = (captured.getvalue(), (events.root / "events.jsonl").read_text(), attempt.path.read_text())
+    assert all(secret not in artifact for secret in (*credentials.values(), "opaque-feed-nonce") for artifact in artifacts)
+    stdin = json.loads(record["stdin"].split("CONTEXT JSON:\n", 1)[1])
+    assert stdin == record["input"]
+    assert stdin["feeds"] == [{"stable_key": identifiers["stable_key"], "token": "[REDACTED]"}]
+    for stored in (record["input"], event):
+        assert stored["identifiers"] == identifiers
+        assert stored["fields"] == dict.fromkeys(names, "[REDACTED]")
+        assert stored["source"].startswith("https://example.com/?stable_key=article-visible-42&topic_key=scan-visible-7&")
+    messages = (record["input"]["objective"], stdin["objective"], json.loads(record["raw"]["text"])["rationale"],
+                record["stderr"]["text"].splitlines()[0], record["response"]["rationale"], event["message"])
+    for stored in messages:
+        decoded = json.loads(stored)
+        for item in (decoded, json.loads(decoded["nested"])):
+            assert item["identifiers"] == identifiers
+            assert item["fields"] == dict.fromkeys(names, "[REDACTED]")
+    assert record["outcome"] == "validated"
 
 
 def check_cli(directory):
@@ -516,7 +642,9 @@ def run(directory, base):
     root.mkdir()
     check_existing_sources(root, base)
     check_storage(root)
+    check_failed_write_cleanup(root)
     check_assignment_redaction(root)
+    check_identifier_redaction(root)
     check_cli(root)
     check_engine_failures(root, base)
     check_rejections(root, base)

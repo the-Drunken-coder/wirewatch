@@ -26,7 +26,10 @@ RAW_BYTES = 262_144
 _EVENT_LOCK = threading.RLock()
 _TRACE_LOCK = threading.RLock()
 _ACTIVE: set[Path] = set()
-_SECRET = re.compile(r"authorization|cookie|password|passwd|secret|credential|(?:^|[_-])(?:token|api[_-]?key|access[_-]?key|key|auth|signature|sig|session[_-]?id)(?:$|[_-])|^(?:access|refresh|id)Token$", re.I)
+_SECRET = re.compile(
+    r"authorization|cookie|password|passwd|secret|credential|^key$|"
+    r"(?:^|[_-])(?:token|(?:api|access|private|signing|encryption)[_-]?key|auth|signature|sig|session[_-]?id)(?:$|[_-])|"
+    r"^(?:access|refresh|id)Token$", re.I)
 _URL = re.compile(r"https?://[^\s<>\"']+", re.I)
 _BEARER = re.compile(r"\bBearer\s+[^\s,;\"']+", re.I)
 _QUOTED = (r'\\"(?:\\\\(?:\\.|[^"\\])|[^"\\\r\n])*\\"'
@@ -292,7 +295,8 @@ class ModelAttempt:
             raise
         finally:
             try:
-                temporary.unlink(missing_ok=True)
+                with _TRACE_LOCK:
+                    temporary.unlink(missing_ok=True)
             except OSError as exc:
                 emergency("model_trace_cleanup_failed", attempt_id=self.id, error=str(exc))
 
