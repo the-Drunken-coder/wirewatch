@@ -1,4 +1,3 @@
-"""Private, bounded local diagnostics, independent of archive transactions."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass

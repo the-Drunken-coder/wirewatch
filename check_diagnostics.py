@@ -1,4 +1,3 @@
-"""Executable diagnostics boundaries using temporary files, HTTP and fake CLI processes."""
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, redirect_stderr
 from http.server import ThreadingHTTPServer

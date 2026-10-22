@@ -434,7 +434,6 @@ def _drain(fd: int, capture: Captured) -> None:
 
 
 def _invoke(command: list[str], prompt: str, output: Path, captures: dict[str, Captured]) -> tuple[int, bool]:
-    # A FIFO bounds the CLI's last-message output without letting a temporary file grow.
     os.mkfifo(output, mode=0o600)
     with selectors.PollSelector() as selector:
         raw = os.open(output, os.O_RDONLY | os.O_NONBLOCK)
@@ -527,7 +526,7 @@ def run_codex(payload: dict[str, object], progress: Callable[[str], None], *, at
                              "duration_ms": round((time.monotonic() - started) * 1000)},
                              **{key: capture.evidence() for key, capture in captured.items()})
             except Exception:
-                pass  # Preserve the original CLI failure when its diagnostic write also fails.
+                pass
             raise
         failure = None
         if timed_out:

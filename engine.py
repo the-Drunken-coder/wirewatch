@@ -501,7 +501,6 @@ class Engine:
 
     def _loop(self) -> None:
         try:
-            # Reserve collection capacity even when an explicit poll checks many slow feeds.
             with ThreadPoolExecutor(max_workers=2, thread_name_prefix="wirewatch-feed") as executor:
                 explicit = automatic = None
                 while not self.stop_event.is_set():

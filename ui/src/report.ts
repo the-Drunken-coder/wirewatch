@@ -51,15 +51,10 @@ function bounded(text: string | null, max: number): string | null {
   return text === null ? null : clip(redact(text), max);
 }
 
-/** Application route without query or fragment. */
 function route(path: string): string {
   return clip(path.split(/[?#]/, 1)[0] ?? '', 256);
 }
 
-/**
- * Repeats of one failure within a minute become a count on its next report, so a failing poll sends
- * at most one report per minute. Sends are rate limited separately; a limited report keeps its count.
- */
 const seen = new Map<string, { at: number; pending: number }>();
 const sent: number[] = [];
 
@@ -88,7 +83,6 @@ function overBudget(body: string): number {
   return new TextEncoder().encode(body).length - maxBytes;
 }
 
-/** Shortens the stack, then the message, until the serialized report fits the endpoint's byte limit. */
 function serialize(report: Report): string {
   let current = report;
   let body = JSON.stringify(current);
@@ -102,7 +96,6 @@ function serialize(report: Report): string {
   return body;
 }
 
-/** Uses raw fetch so a failing report can never report itself. */
 async function send(report: Report): Promise<void> {
   try {
     const response = await fetch(endpoint, {

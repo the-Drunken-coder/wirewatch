@@ -245,7 +245,6 @@ async function readJson(response: Response): Promise<unknown> {
   return body;
 }
 
-/** Sends one correlated request. Failures are reported here, then rethrown unchanged for the caller's message. */
 async function request(path: string, init: RequestInit): Promise<{ body: unknown; requestId: RequestId }> {
   const requestId = newRequestId();
   const correlation = { request_id: requestId, path, issue_path: null, stack: null };
