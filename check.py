@@ -1397,8 +1397,9 @@ def check_setup_requested_sources(directory, base):
             assert engine.state() == before
             rules, mode = Rules.parse(RULES), ScanWindow.parse(window)
             assert review.parse_actions([], rules, {url}, {url}, mode).feeds == {url}
-            for tool in ("add_feed", "probe_feed"):
-                rejected(lambda: review.parse_actions([review_action(tool, url=url)], rules, {url}, {url}, mode), error=Rejected)
+            assert review.parse_actions([review_action("add_feed", url=url)], rules, {url}, set(), mode).feeds == {url}
+            rejected(lambda: review.parse_actions([review_action("add_feed", url=url)], rules, {base + "/rss"}, {url}, mode), error=Rejected)
+            rejected(lambda: review.parse_actions([review_action("probe_feed", url=url)], rules, {url}, {url}, mode), error=Rejected)
 
 
 def check_setup_terminal_diagnostics(directory, base):

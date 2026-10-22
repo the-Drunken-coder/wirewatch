@@ -280,9 +280,10 @@ def parse_actions(actions: list[dict[str, object]], rules: Rules, feeds: set[str
                 field = ".feed_url"
                 url = safe_url(action["feed_url"])
                 if tool == "add_feed":
-                    probe_source(url)
-                    if url not in allowed:
-                        raise ValueError("New subscriptions require an existing authorized feed or a successfully executed probe")
+                    if url not in feeds:
+                        probe_source(url)
+                        if url not in allowed:
+                            raise ValueError("New subscriptions require an existing authorized feed or a successfully executed probe")
                     desired.add(url)
                 else:
                     if url not in feeds:

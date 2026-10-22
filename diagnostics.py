@@ -27,62 +27,54 @@ _EVENT_LOCK = threading.RLock()
 _TRACE_LOCK = threading.RLock()
 _ACTIVE: set[Path] = set()
 _SECRET = re.compile(
-    r"authorization|cookie|password|passwd|secret|credential|^key$|"
-    r"(?:^|[_-])(?:token|(?:api|access|private|signing|encryption)[_-]?key|auth|signature|sig|session[_-]?id)(?:$|[_-])|"
-    r"^(?:access|refresh|id)Token$", re.I)
+    r"(?:^|[_-])(?:authorization|cookies?|passwords?|passwd|secrets?|credentials?|key|token|"
+    r"(?:api|access|private|signing|encryption)[_-]?key|auth|signature|sig|session[_-]?id)(?:$|[_-])", re.I)
 _URL = re.compile(r"https?://[^\s<>\"']+", re.I)
 _BEARER = re.compile(r"\bBearer\s+[^\s,;\"']+", re.I)
-_QUOTED = (r'\\"(?:\\\\(?:\\.|[^"\\])|[^"\\\r\n])*\\"'
-           r'|"(?:\\.|[^"\\\r\n])*"'
-           r"|'(?:\\.|[^'\\\r\n])*'")
 _ASSIGNMENT = re.compile(
-    rf'''(?<![\w.-])(?:(?P<prefix>(?P<name>{_QUOTED}|[\w.-]+)\s*[:=]\s*)'''
-    rf'''(?P<value>{_QUOTED}|[^\s,;{{}}\[\]&]+)|(?P<quoted>{_QUOTED}))''')
+    r'''(?:(?P<quote>\\*["'])|\\+[nrt]|(?<![\w.-]))(?P<name>(?:\\+u[0-9a-fA-F]{4}|[\w.-])+)
+        (?(quote)(?P=quote))\s*[:=]\s*''', re.X)
 _HEADER = re.compile(r"(?<![\"'])\b(authorization|(?:set-)?cookie)\s*[:=]\s*[^\r\n]*", re.I)
 _CREDENTIAL = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b")
 
 
 def _sensitive_name(name: str) -> bool:
+    if name in ("stable_key", "topic_key"):
+        return False
+    name = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", name)
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
     return _SECRET.search(name) is not None
 
 
-def _unquote(value: str) -> str:
-    if value.startswith(r'\"'):
-        value = json.loads('"' + value + '"')
-    if value[0] == "'":
-        value = '"' + re.sub(r'\\.|"', lambda match: {"\\'": "'", '"': '\\"'}.get(match[0], match[0]), value[1:-1]) + '"'
-    return json.loads(value)
-
-
-def _redact_assignment(match: re.Match[str]) -> str:
-    name = match["name"]
-    prefix = match["prefix"] or ""
-    value = match["value"] or match["quoted"]
-    quote = value[0] if len(value) >= 2 and value[0] in ('"', "'") and value[-1] == value[0] else ""
-    if value.startswith(r'\"') and value.endswith(r'\"'):
-        quote = r'\"'
-    if name is not None:
-        if name.startswith(('"', "'", r'\"')):
-            try:
-                name = _unquote(name)
-            except json.JSONDecodeError:
-                pass
-        if _sensitive_name(name):
-            return prefix + quote + "[REDACTED]" + quote
-    decoded = value
-    if quote:
-        try:
-            decoded = _unquote(value)
-        except json.JSONDecodeError:
-            return match[0]
-    clean = str(redact(decoded))
-    if clean == decoded:
-        return match[0]
-    if quote:
-        clean = json.dumps(clean, ensure_ascii=False)
-        if quote == r'\"':
-            clean = json.dumps(clean, ensure_ascii=False)[1:-1]
-    return prefix + clean
+def _redact_assignments(value: str) -> str:
+    parts: list[str] = []
+    end = 0
+    for match in _ASSIGNMENT.finditer(value):
+        if match.start() < end:
+            continue
+        name = re.sub(r"\\+u([0-9a-fA-F]{4})", lambda item: chr(int(item[1], 16)), match["name"])
+        if not _sensitive_name(name):
+            continue
+        start = match.end()
+        opening = re.match(r'''\\*["']''', value[start:])
+        quote = opening[0] if opening else ""
+        if quote:
+            slashes = len(quote) - 1
+            stop = len(value)
+            for closing in re.finditer(r'''\\*["']''', value[start + len(quote):]):
+                # A closing quote has the same escape level as the opening quote.
+                if closing[0][-1] == quote[-1] and (len(closing[0]) - 1) % (2 * (slashes + 1)) == slashes:
+                    stop = start + len(quote) + closing.end()
+                    break
+        elif name.lower() in ("authorization", "cookie", "set-cookie"):
+            stop = start + re.match(r'''(?:\\+(?![\\nrt"'])[^\r\n]|[^\r\n"'\\])*''', value[start:]).end()
+        else:
+            stop = start + re.match(r'''(?:\\+(?![\\nrt"'])[^\r\n]|[^\s,;{}\[\]&"'\\])*''', value[start:]).end()
+        if stop == start:
+            continue
+        parts.extend((value[end:start], quote, "[REDACTED]", quote))
+        end = stop
+    return "".join(parts) + value[end:]
 
 
 def _url(match: re.Match[str], *, nested: bool = False) -> str:
@@ -119,7 +111,7 @@ def redact(value: object) -> object:
         value = _URL.sub(_url, value)
         value = _BEARER.sub("Bearer [REDACTED]", value)
         value = _HEADER.sub(lambda match: match[1] + "=[REDACTED]", value)
-        value = _ASSIGNMENT.sub(_redact_assignment, value)
+        value = _redact_assignments(value)
         return _CREDENTIAL.sub("[REDACTED]", value)
     if value is None or isinstance(value, (bool, int, float)):
         return value

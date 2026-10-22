@@ -1315,7 +1315,8 @@ class Engine:
                             raise ValueError("Setup must use the requested custom feeds or default topic search")
                         if url not in allowed_urls:
                             raise ValueError("Model selected a feed outside the supplied discovery catalog")
-                        if kind != "setup" or setup_urls is None:
+                        subscribed = db.execute("SELECT 1 FROM feeds WHERE scan_id=? AND url=?", (scan_id, url)).fetchone()
+                        if not (kind == "audit" and subscribed) and (kind != "setup" or setup_urls is None):
                             review.probe_source(url)
                         self._subscribe(db, scan_id, url)
                     elif tool == "replay_history":

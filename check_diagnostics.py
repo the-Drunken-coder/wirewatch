@@ -85,21 +85,46 @@ def check_existing_sources(directory, base):
         with engine.transaction() as db:
             db.execute("UPDATE feeds SET url=? WHERE scan_id=?", (url, scan_id))
             db.execute("INSERT OR IGNORE INTO feed_state(url,next_check_at) VALUES (?,0)", (url,))
+            original_feed = dict(db.execute("SELECT id,scan_id,url,token FROM feeds WHERE scan_id=?", (scan_id,)).fetchone())
         engine.apply_plan({"rationale": "An empty plan remains valid", "actions": []}, [], "audit", "Fixture")
-        def empty(payload, progress, **kwargs):
-            return {"page_number": payload["page_number"], "rationale": "No changes", "stable": False, "findings": [], "actions": []}
-        engine.control_setup_review({"scan_id": scan_id, "action": "start"})
-        probe = {"id": 1, "url": base + "/atom", "query": None, "independent": True,
-                 "articles": [{**article.__dict__, "window_reason": None} for article in model.fetch_feed(base + "/atom")],
-                 "item_count": 1, "in_window_count": 1, "error": None, "executed_at": model.now()}
+        action = {"tool": "subscribe_feed", "scan_ref": str(scan_id), "feed_url": url, "rationale": "Keep the existing source"}
+        audit_job = engine.enqueue("audit")
+        with patch("engine.fetch_feed", return_value=[]), patch("engine.run_codex", return_value={
+                "rationale": "Retain existing subscription", "actions": [action]}) as calls:
+            assert engine.run_next("model") and calls.call_count == 1
+        assert next(job for job in engine.state()["jobs"] if job["id"] == audit_job)["status"] == "completed"
+        assert engine.state()["audits"][0]["status"] == "completed"
+        assert not engine.run_next("model"), "Existing subscription caused a paid retry"
         with engine.transaction() as db:
-            db.execute("UPDATE setup_runs SET probes=? WHERE scan_id=?", (json.dumps([probe]), scan_id))
-        with patch("engine.fetch_conditional", return_value=model.FeedFetch([], model.Validators())):
-            review_turn(engine, scan_id, empty)
-        trace = trace_records(engine)[0]
-        assert trace["outcome"] == "applied" and "error" not in trace
-        assert trace["response"]["actions"] == []
-        assert all(job["status"] == "completed" for job in engine.state()["jobs"] if job["kind"] == "setup_review")
+            assert dict(db.execute("SELECT id,scan_id,url,token FROM feeds WHERE scan_id=?", (scan_id,)).fetchone()) == original_feed
+        other_id = engine.create_scan({"topic": "Other target", "objective": "Keep ownership strict", "rules": RULES,
+                                       "feed_urls": [base + "/rss"]})
+        before = engine.state()
+        fails(lambda: engine.apply_plan({"rationale": "Cross-target is a new subscription", "actions": [
+            {**action, "scan_ref": str(other_id)}]}, [{"url": url}], "audit", "Fixture"), Rejected)
+        assert engine.state() == before
+        for actions in ([], [{"tool": "add_feed", "rules": None, "feed_url": url, "query": None,
+                              "rationale": "Already subscribed to this target"}]):
+            def retain(payload, progress, **kwargs):
+                return {"page_number": payload["page_number"], "rationale": "Keep the source", "stable": False,
+                        "findings": [], "actions": actions}
+            engine.control_setup_review({"scan_id": scan_id, "action": "start"})
+            probe = {"id": 1, "url": base + "/atom", "query": None, "independent": True,
+                     "articles": [{**article.__dict__, "window_reason": None} for article in model.fetch_feed(base + "/atom")],
+                     "item_count": 1, "in_window_count": 1, "error": None, "executed_at": model.now()}
+            with engine.transaction() as db:
+                db.execute("UPDATE setup_runs SET probes=? WHERE scan_id=?", (json.dumps([probe]), scan_id))
+            with patch("engine.fetch_conditional", return_value=model.FeedFetch([], model.Validators())):
+                calls = review_turn(engine, scan_id, retain)
+            assert calls.call_count == 1
+            traces = trace_records(engine)
+            assert all(item["outcome"] == "applied" and "error" not in item for item in traces)
+            trace = next(item for item in traces if item["correlation"]["kind"] == "setup_review"
+                         and item["response"]["actions"] == actions)
+            with engine.transaction() as db:
+                assert dict(db.execute("SELECT id,scan_id,url,token FROM feeds WHERE scan_id=?", (scan_id,)).fetchone()) == original_feed
+            assert next(job for job in engine.state()["jobs"] if job["id"] == trace["correlation"]["job_id"])["status"] == "completed"
+            assert engine.setup_history(scan_id)["calls_used"] == 1
     valid = model.query_url("(" + "term " * 350 + ") after:2026-01-01 before:2026-01-02")
     assert review.source_identity(valid) == review.probe_source(valid)
     fails(lambda: review.source_identity("https://user:secret@example.com/"))
@@ -358,7 +383,9 @@ def check_identifier_redaction(directory):
     identifiers = {"stable_key": "article-visible-42", "topic_key": "scan-visible-7"}
     names = ("key", "token", "auth", "sig", "api_key", "access-key", "privateKey", "signing_key", "encryption_key",
              "secret_key", "tenant_api_key", "tenant-access-key", "tenant_private_key", "tenant-signing-key",
-             "tenant_encryption_key", "tenant_secret_key")
+             "tenant_encryption_key", "tenant_secret_key", "app_key", "client_key", "license_key", "subscription_key",
+             "app-key", "client-key", "license-key", "subscription-key", "tenantServiceKey", "clientSecret",
+             "tenantPassword", "tenantCookie", "tenantCredential", "tenantAuth", "secrets", "credentials", "cookies", "passwords")
     credentials = {name: f"opaque-credential-{index}" for index, name in enumerate(names)}
     detail = {"identifiers": identifiers, "fields": credentials}
     message = json.dumps({**detail, "nested": json.dumps(detail)})
@@ -393,6 +420,61 @@ def check_identifier_redaction(directory):
             assert item["identifiers"] == identifiers
             assert item["fields"] == dict.fromkeys(names, "[REDACTED]")
     assert record["outcome"] == "validated"
+
+
+def check_long_evidence(directory, base):
+    root = directory / "long-evidence"
+    root.mkdir()
+    evidence = {"colon": "Fingerprint " + "ab:" * 600, "equals": "Comparison " + "ab=" * 600,
+                "prose": "Press Secretary: Taylor said the Secretary announced a new policy.",
+                "stable_key": "visible-article", "topic_key": "visible-scan"}
+    secret = r"opaque-long-evidence\value"
+    embedded = evidence["colon"] + f" client_key={secret} " + evidence["equals"] + f"\ntoken={secret}"
+    message = json.dumps({**evidence, "embedded": embedded})
+    payload = {"objective": message, **evidence}
+    events = Events(root)
+    store = ModelTraces(root, events)
+    captured = StringIO()
+    with redirect_stderr(captured), fake_cli(root, "redaction"):
+        events.emit("long_evidence", **payload)
+        with store.open(AttemptKey("long-evidence", "audit"), payload, model.PLAN_SCHEMA, model.MODEL_PROMPT) as attempt:
+            result = model.run_codex(payload, lambda _: None, attempt=attempt)
+    assert result == {"rationale": message, "actions": []}
+    record = json.loads(attempt.path.read_bytes())
+    event = json.loads((events.root / "events.jsonl").read_bytes().splitlines()[0])
+    stdin = json.loads(record["stdin"].split("CONTEXT JSON:\n", 1)[1])
+    assert stdin == record["input"] and record["outcome"] == "validated"
+    messages = (record["input"]["objective"], stdin["objective"], json.loads(record["raw"]["text"])["rationale"],
+                record["stderr"]["text"].splitlines()[0], record["response"]["rationale"], event["objective"])
+    for stored in messages:
+        assert json.loads(stored) == {**evidence, "embedded": embedded.replace(secret, "[REDACTED]")}
+    for stored in (record["input"], event):
+        assert all(stored[name] == value for name, value in evidence.items())
+    assert all("opaque-long-evidence" not in artifact for artifact in (captured.getvalue(), attempt.path.read_text(),
+                                                                      (events.root / "events.jsonl").read_text()))
+    engine, scan_id = fixture(directory / "long-evidence-jobs", base)
+    with engine.transaction() as db:
+        db.execute("UPDATE articles SET summary=?", (embedded + " " + evidence["prose"],))
+    audit_id = engine.enqueue("decision_audit")
+    with patch("engine.run_codex", return_value={"rationale": "Review complete", "actions": []}) as calls:
+        assert engine.run_next("model") and calls.call_count == 1
+    assert next(job for job in engine.state()["jobs"] if job["id"] == audit_id)["status"] == "completed"
+    expected_summary = embedded.replace(secret, "[REDACTED]") + " " + evidence["prose"]
+    assert all(article["summary"] == expected_summary for article in trace_records(engine)[0]["input"]["history"])
+    engine.control_setup_review({"scan_id": scan_id, "action": "start"})
+    probe = {"id": 1, "url": base + "/atom", "query": None, "independent": True,
+             "articles": [{**article.__dict__, "window_reason": None} for article in model.fetch_feed(base + "/atom")],
+             "item_count": 1, "in_window_count": 1, "error": None, "executed_at": model.now()}
+    with engine.transaction() as db:
+        db.execute("UPDATE setup_runs SET probes=? WHERE scan_id=?", (json.dumps([probe]), scan_id))
+    def page(payload, progress, **kwargs):
+        assert evidence["colon"] in json.dumps(payload) and evidence["equals"] in json.dumps(payload)
+        return {"page_number": payload["page_number"], "rationale": "Page complete", "stable": False,
+                "findings": [], "actions": []}
+    calls = review_turn(engine, scan_id, page)
+    assert calls.call_count == 1 and engine.setup_history(scan_id)["calls_used"] == 1
+    assert all(job["status"] == "completed" for job in engine.state()["jobs"] if job["kind"] == "setup_review")
+    assert not engine.run_next("model"), "Long evidence caused an automatic model retry"
 
 
 def check_nested_url_redaction(directory):
@@ -672,6 +754,15 @@ def check_http(directory, base):
         assert stored["event"] == "client_error" and stored["request_id"] == report["request_id"]
         assert stored["reporting_request_id"] == reporting_id and stored["stack"] == unicode_report["stack"]
         assert "café 😀".encode("utf-8") in unicode_line and b"\\ud800" in unicode_line and b"\\udfff" in unicode_line
+        long_message = "Browser fingerprint " + "ab:" * 600
+        long_stack = "Browser comparison " + "ab=" * 600 + " client_key=opaque-browser-key"
+        status, reporting_id, result = request("/api/client-errors", {**report, "message": long_message, "stack": long_stack})
+        assert status == 200 and result == {"ok": True}
+        records = [json.loads(line) for line in (engine.events.root / "events.jsonl").read_bytes().splitlines()]
+        stored = next(item for item in records if item.get("reporting_request_id") == reporting_id)
+        assert stored["event"] == "client_error" and stored["message"] == long_message
+        assert stored["stack"] == long_stack.replace("opaque-browser-key", "[REDACTED]")
+        assert "opaque-browser-key" not in (engine.events.root / "events.jsonl").read_text()
         status, request_id, result = request("/api/replay", {"scan_id": scan_id})
         deadline = time.monotonic() + 2
         while True:
@@ -697,6 +788,7 @@ def run(directory, base):
     check_failed_write_cleanup(root)
     check_assignment_redaction(root)
     check_identifier_redaction(root)
+    check_long_evidence(root, base)
     check_nested_url_redaction(root)
     check_cli(root)
     check_engine_failures(root, base)
@@ -708,4 +800,5 @@ def run(directory, base):
             "trace preflight before initial and page reservations", "required diagnostic failure prevents model effects",
             "postcommit diagnostic failure preserves completed effects", "original rejection survives diagnostic failure",
             "rejected evidence paths duplicate refs and stale snapshot details", "collector independence from unavailable diagnostics",
-            "HTTP IDs guards errors strict client reports and locked rate limit"]
+            "HTTP IDs guards errors strict client reports and locked rate limit",
+            "long colon and equals evidence survives traces model jobs and HTTP reports"]
