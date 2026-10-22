@@ -343,8 +343,11 @@ def check_assignment_redaction(directory):
     root = directory / "assignment-redaction"
     root.mkdir()
     names = ("OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "client_secret", "tenant-token", "tenant_auth",
-             "tenant_signature", "client_session_id", "accessToken")
+             "tenant_signature", "client_session_id", "accessToken", "db.password", "db.passwd", "db.token", "db.secret",
+             "db.password.value", "db.passwd.value", "db.token.value", "db.secret.value")
     fields = {name: f"opaque-assignment-{index}" for index, name in enumerate(names)}
+    benign = {"stable_key": "article-visible-42", "topic_key": "scan-visible-7", "db.monkey": "visible-monkey",
+              "db.tokenizer": "visible-tokenizer", "db.secretary": "visible-secretary", "db.passwordless": "visible-passwordless"}
     assignments = []
     for name, secret in fields.items():
         quoted = json.dumps({name: secret + ' "private" \\ tail', "safe": "visible-neighbor"})
@@ -354,14 +357,17 @@ def check_assignment_redaction(directory):
                             quoted, escaped, json.dumps(escaped), json.dumps(escaped)[1:-1], json.dumps({"detail": escaped}),
                             json.dumps({"detail": f"Cookie: first={secret}; second={secret}"})))
     neighbors = "safe_neighbor=visible-neighbor monkey=visible-neighbor tokenizer=visible-neighbor"
+    neighbors += " " + " ".join(f"{name}={value}" for name, value in benign.items())
+    neighbors += " Press Secretary: Taylor said the Secretary announced a new policy."
     message = "\n".join(assignments) + "\n" + neighbors
-    url = "https://example.com/?" + "&".join(f"%{ord(name[0]):02x}{name[1:]}={secret}" for name, secret in fields.items()) + "&q=visible-neighbor"
-    payload = {"objective": message, "fields": fields, "source": url, "safe": "visible-neighbor"}
+    url = "https://example.com/?" + "&".join(f"%{ord(name[0]):02x}{name[1:]}={secret}" for name, secret in fields.items())
+    url += "&" + "&".join(f"{name}={value}" for name, value in benign.items()) + "&q=visible-neighbor"
+    payload = {"objective": message, "fields": fields, "source": url, "safe": "visible-neighbor", "benign": benign}
     events = Events(root)
     store = ModelTraces(root, events)
     captured = StringIO()
     with redirect_stderr(captured), fake_cli(root, "redaction"):
-        events.emit("assignment_redaction", message=message, fields=fields, source=url, safe="visible-neighbor")
+        events.emit("assignment_redaction", message=message, fields=fields, source=url, safe="visible-neighbor", benign=benign)
         with store.open(AttemptKey("assignment-redaction", "audit"), payload, model.PLAN_SCHEMA, model.MODEL_PROMPT) as attempt:
             result = model.run_codex(payload, lambda _: None, attempt=attempt)
     assert result == {"rationale": message, "actions": []}
@@ -371,6 +377,9 @@ def check_assignment_redaction(directory):
     assert all(secret not in artifact for secret in fields.values() for artifact in artifacts)
     for stored in (record["input"], event):
         assert stored["fields"] == dict.fromkeys(names, "[REDACTED]") and stored["safe"] == "visible-neighbor"
+        assert stored["benign"] == benign
+        assert parse_qs(urlsplit(stored["source"]).query) == {
+            **dict.fromkeys(names, ["[REDACTED]"]), **{name: [value] for name, value in benign.items()}, "q": ["visible-neighbor"]}
         assert stored["source"].endswith("&q=visible-neighbor")
     for stored in (record["stdin"], record["raw"]["text"], record["stderr"]["text"], event["message"]):
         assert all(name in stored for name in names) and neighbors in stored

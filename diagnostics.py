@@ -27,8 +27,8 @@ _EVENT_LOCK = threading.RLock()
 _TRACE_LOCK = threading.RLock()
 _ACTIVE: set[Path] = set()
 _SECRET = re.compile(
-    r"(?:^|[_-])(?:authorization|cookies?|passwords?|passwd|secrets?|credentials?|key|token|"
-    r"(?:api|access|private|signing|encryption)[_-]?key|auth|signature|sig|session[_-]?id)(?:$|[_-])", re.I)
+    r"(?:^|[_.-])(?:authorization|cookies?|passwords?|passwd|secrets?|credentials?|key|token|"
+    r"(?:api|access|private|signing|encryption)[_-]?key|auth|signature|sig|session[_-]?id)(?:$|[_.-])", re.I)
 _URL = re.compile(r"https?://[^\s<>\"']+", re.I)
 _BEARER = re.compile(r"\bBearer\s+[^\s,;\"']+", re.I)
 _ASSIGNMENT = re.compile(
