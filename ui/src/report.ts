@@ -55,7 +55,7 @@ function route(path: string): string {
   return clip(path.split(/[?#]/, 1)[0] ?? '', 256);
 }
 
-const seen = new Map<string, { at: number; pending: number }>();
+const seen = new Map<string, { lastAdmittedAtMs: number; pendingReportCount: number }>();
 const sent: number[] = [];
 
 function sendAllowed(now: number): boolean {
@@ -65,18 +65,20 @@ function sendAllowed(now: number): boolean {
   return true;
 }
 
-function admit(fingerprint: string, limited: boolean): number | null {
+function admitReport(fingerprint: string, limitServerSends: boolean): number | null {
   const now = Date.now();
   const entry = seen.get(fingerprint);
-  const count = Math.min((entry?.pending ?? 0) + 1, maxCount);
-  const allowed = !(entry && now - entry.at < windowMs) && (!limited || sendAllowed(now));
+  const count = Math.min((entry?.pendingReportCount ?? 0) + 1, maxCount);
+  const admitted = !(entry && now - entry.lastAdmittedAtMs < windowMs) && (!limitServerSends || sendAllowed(now));
   seen.delete(fingerprint);
-  seen.set(fingerprint, allowed ? { at: now, pending: 0 } : { at: entry?.at ?? -Infinity, pending: count });
+  seen.set(fingerprint, admitted
+    ? { lastAdmittedAtMs: now, pendingReportCount: 0 }
+    : { lastAdmittedAtMs: entry?.lastAdmittedAtMs ?? -Infinity, pendingReportCount: count });
   if (seen.size > maxFingerprints) {
     const oldest = seen.keys().next();
     if (!oldest.done) seen.delete(oldest.value);
   }
-  return allowed ? count : null;
+  return admitted ? count : null;
 }
 
 function overBudget(body: string): number {
@@ -96,7 +98,7 @@ function serialize(report: Report): string {
   return body;
 }
 
-async function send(report: Report): Promise<void> {
+async function sendDiagnosticViaRawFetch(report: Report): Promise<void> {
   try {
     const response = await fetch(endpoint, {
       method: 'POST',
@@ -121,10 +123,10 @@ export function report(error: ClientError, delivery: 'server' | 'console' = 'ser
   };
   const local = delivery === 'console' || !navigator.onLine;
   const fingerprint = JSON.stringify([local, clean.kind, clean.path, clean.status, clean.issue_path, clean.message]);
-  const count = admit(fingerprint, !local);
+  const count = admitReport(fingerprint, !local);
   if (count === null) return;
   if (local) console.warn('Wirewatch browser error (not sent while offline).', { ...clean, count });
-  else void send({ ...clean, count });
+  else void sendDiagnosticViaRawFetch({ ...clean, count });
 }
 
 function describe(value: unknown): { message: string; stack: string | null } {
