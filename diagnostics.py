@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
-from urllib.parse import unquote_plus, urlsplit, urlunsplit
+from urllib.parse import quote_plus, unquote_plus, urlsplit
 import json
 import os
 import re
@@ -85,13 +85,27 @@ def _redact_assignment(match: re.Match[str]) -> str:
     return prefix + clean
 
 
-def _url(match: re.Match[str]) -> str:
+def _url(match: re.Match[str], *, nested: bool = False) -> str:
     try:
-        parts = urlsplit(match.group())
+        url = match.group()
+        parts = urlsplit(url)
         host = parts.netloc.rsplit("@", 1)[-1]
-        query = "&".join(part.partition("=")[0] + "=%5BREDACTED%5D" if _sensitive_name(unquote_plus(part.partition("=")[0])) else part
-                         for part in parts.query.split("&"))
-        return urlunsplit((parts.scheme, host, parts.path, query, parts.fragment))
+        head, fragment_separator, fragment = url.partition("#")
+        prefix, query_separator, query = head.partition("?")
+        clean_parts = []
+        for part in query.split("&"):
+            name, separator, value = part.partition("=")
+            if _sensitive_name(unquote_plus(name)):
+                part = name + "=%5BREDACTED%5D"
+            elif separator and not nested:
+                decoded = unquote_plus(value)
+                clean = _URL.sub(lambda item: _url(item, nested=True), decoded)
+                if clean != decoded:
+                    part = name + separator + quote_plus(clean)
+            clean_parts.append(part)
+        if host != parts.netloc:
+            prefix = prefix.replace("://" + parts.netloc, "://" + host, 1)
+        return prefix + query_separator + "&".join(clean_parts) + fragment_separator + fragment
     except ValueError:
         return "[REDACTED URL]"
 

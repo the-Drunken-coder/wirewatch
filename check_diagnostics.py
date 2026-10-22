@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import Event, Thread, current_thread
 from unittest.mock import patch
 from urllib.error import HTTPError
+from urllib.parse import parse_qs, unquote, urlsplit
 from urllib.request import Request, urlopen
 import json
 import os
@@ -394,6 +395,57 @@ def check_identifier_redaction(directory):
     assert record["outcome"] == "validated"
 
 
+def check_nested_url_redaction(directory):
+    root = directory / "nested-url-redaction"
+    root.mkdir()
+    secret = "nested-fixture-secret"
+    urls = [
+        f"https://example.com/rss?next=https://user:{secret}@evil.test/x&q=visible&q=&blank=&flag",
+        f"https://example.com/rss?next=https%3A%2F%2Fuser%3A{secret}%40evil.test%2Fx&q=hello%20world&q=&blank=&flag#keep",
+        f"https://example.com/rss?next=https%3a%2f%2f{secret}%40evil.test%2fx&q=hello+world",
+        f"https://example.com/rss?next=visit+https%3A%2F%2Fuser%3A{secret}%40evil.test%2Fx+now&q=visible",
+        f"https://example.com/rss?next=https%3A%2F%2Fevil.test%2Fx%3Fclient_secret%3D{secret}%26q%3Dvisible&q=outer",
+        f"https://example.com/rss?client%5Fsecret={secret}&next=https%3a%2f%2fevil.test%2fx&q=visible",
+    ]
+    harmless = [
+        "https://example.com/rss?next=https%3a%2f%2fevil.test%2fx%3fq%3dhello%2520world&q=one%20two&q=&blank=&flag&&plus=%2b#keep",
+        "https://example.com/rss?next=https://evil.test/x&q=hello+world&q=&blank=&flag",
+        "https://news.google.com/rss/search?q=chip%20after%3A2026-01-01&q=&hl=en-US&gl=US&ceid=US%3Aen",
+        "HTTPS://Example.COM/rss?", "https://example.com/rss?#", "https://example.com/rss#",
+    ]
+    message = json.dumps({"urls": urls, "harmless": harmless})
+    payload = {"objective": message, "feed_urls": urls, "harmless": harmless}
+    events = Events(root)
+    store = ModelTraces(root, events)
+    captured = StringIO()
+    with redirect_stderr(captured), fake_cli(root, "redaction"):
+        events.emit("feeds_saved", **payload)
+        with store.open(AttemptKey("nested-url-redaction", "audit"), payload, model.PLAN_SCHEMA, model.MODEL_PROMPT) as attempt:
+            result = model.run_codex(payload, lambda _: None, attempt=attempt)
+    assert result == {"rationale": message, "actions": []}
+    artifacts = (captured.getvalue(), (events.root / "events.jsonl").read_text(), attempt.path.read_text())
+    assert all(secret not in unquote(artifact) for artifact in artifacts), "Nested URL userinfo leaked into stored diagnostics"
+    record = json.loads(attempt.path.read_bytes())
+    event = json.loads((events.root / "events.jsonl").read_bytes().splitlines()[0])
+    stdin = json.loads(record["stdin"].split("CONTEXT JSON:\n", 1)[1])
+    assert stdin == record["input"] and record["outcome"] == "validated"
+    for stored in (record["input"], event):
+        assert stored["harmless"] == harmless
+        assert stored["feed_urls"][0].endswith("&q=visible&q=&blank=&flag")
+        assert stored["feed_urls"][1].endswith("&q=hello%20world&q=&blank=&flag#keep")
+        assert stored["feed_urls"][2].endswith("&q=hello+world")
+        for url in stored["feed_urls"][:3]:
+            assert parse_qs(urlsplit(url).query)["next"] == ["https://evil.test/x"]
+        assert parse_qs(urlsplit(stored["feed_urls"][3]).query)["next"] == ["visit https://evil.test/x now"]
+        inner = parse_qs(urlsplit(stored["feed_urls"][4]).query)["next"][0]
+        assert parse_qs(urlsplit(inner).query) == {"client_secret": ["[REDACTED]"], "q": ["visible"]}
+        assert stored["feed_urls"][5].endswith("&next=https%3a%2f%2fevil.test%2fx&q=visible")
+    messages = (record["input"]["objective"], stdin["objective"], json.loads(record["raw"]["text"])["rationale"],
+                record["stderr"]["text"].splitlines()[0], record["response"]["rationale"], event["objective"])
+    for stored in messages:
+        assert json.loads(stored) == {"urls": event["feed_urls"], "harmless": harmless}
+
+
 def check_cli(directory):
     root = directory / "cli"
     root.mkdir()
@@ -645,6 +697,7 @@ def run(directory, base):
     check_failed_write_cleanup(root)
     check_assignment_redaction(root)
     check_identifier_redaction(root)
+    check_nested_url_redaction(root)
     check_cli(root)
     check_engine_failures(root, base)
     check_rejections(root, base)
