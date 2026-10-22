@@ -121,12 +121,21 @@ def check_storage(directory):
     data = attempt.path.read_text()
     assert "Private success input" in data and secret not in data
     assert secret not in (events.root / "events.jsonl").read_text()
+    unicode_message = "café 😀 " + chr(0xD800) + "|" + chr(0xDFFF)
+    with store.open(AttemptKey("unicode", "audit"), {"message": unicode_message}, {}, "") as unicode_attempt:
+        pass
+    unicode_bytes = unicode_attempt.path.read_bytes()
+    assert json.loads(unicode_bytes)["input"]["message"] == unicode_message
+    assert "café 😀".encode("utf-8") in unicode_bytes and b"\\ud800|\\udfff" in unicode_bytes
     for root in (events.root, store.root):
         assert stat.S_IMODE(root.stat().st_mode) == 0o700
     for target in (attempt.path, events.root / "events.jsonl"):
         assert stat.S_IMODE(target.stat().st_mode) == 0o600
     oversized = fails(lambda: store.open(AttemptKey("large", "audit"), {"input": "x" * 4_000_000}, {}, ""), RuntimeError)
     assert "No model call" in str(oversized)
+    oversized = fails(lambda: store.open(AttemptKey("large-surrogates", "audit"),
+                      {"input": chr(0xD800) * (4_000_000 // 6 + 1)}, {}, ""), RuntimeError)
+    assert "Complete model trace exceeds 4000000 bytes" in str(oversized.__cause__)
     active = store.open(AttemptKey("active", "audit"), {"important": "active"}, {}, "")
     def retain(index):
         with store.open(AttemptKey(str(index), "audit"), {"index": index}, {}, ""):
@@ -157,6 +166,10 @@ def check_storage(directory):
     events.emit("bounded", message="é" * 20_000, nested=["x" * 20_000] * 3)
     line = (events.root / "events.jsonl").read_bytes().splitlines()[-1]
     assert len(line) + 1 <= 16_384 and json.loads(line)["truncated"]
+    events.emit("bounded_surrogates", message=chr(0xD800) * 20_000)
+    line = (events.root / "events.jsonl").read_bytes().splitlines()[-1]
+    assert len(line) + 1 <= 16_384 and json.loads(line)["truncated"]
+    assert json.loads(line)["original_bytes"] > 16_384
     victim = path / "victim"
     victim.write_text("unchanged")
     (events.root / "events.jsonl").unlink()
@@ -187,11 +200,15 @@ args = sys.argv
 output = pathlib.Path(args[args.index("--output-last-message") + 1])
 assert stat.S_ISFIFO(output.stat().st_mode), "CLI output was not bounded by a pipe"
 prompt = sys.stdin.buffer.read()
+mode = ''' + repr(mode) + '''
+if mode == "redaction":
+    objective = json.loads(prompt.decode().split("CONTEXT JSON:\\n", 1)[1])["objective"]
+    sys.stderr.write(objective + "\\n")
+    sys.stderr.flush()
 sys.stdout.buffer.write(("stdout-prefix pid=" + str(os.getpid()) + "\\n").encode() + b"o" * 90000)
 sys.stdout.flush()
 sys.stderr.buffer.write(b"Authorization: Bearer secret-cli-token\\n" + b"e" * 90000)
 sys.stderr.flush()
-mode = ''' + repr(mode) + '''
 if mode == "nonzero":
     output.write_text('{"rejected":"nonzero raw response"}')
     sys.exit(7)
@@ -206,11 +223,49 @@ elif mode == "array":
 elif mode == "oversize":
     output.write_text("x" * 300000)
 else:
-    output.write_text(json.dumps({"rationale":"Safe fake CLI result", "actions":[]}))
+    output.write_text(json.dumps({"rationale": objective if mode == "redaction" else "Safe fake CLI result", "actions":[]}))
 ''')
     path.chmod(0o700)
     with patch("model.codex_path", return_value=str(path)):
         yield
+
+
+def check_assignment_redaction(directory):
+    root = directory / "assignment-redaction"
+    root.mkdir()
+    names = ("OPENAI_API_KEY", "AWS_SECRET_ACCESS_KEY", "client_secret", "tenant-token", "tenant_auth",
+             "tenant_signature", "client_session_id", "accessToken")
+    fields = {name: f"opaque-assignment-{index}" for index, name in enumerate(names)}
+    assignments = []
+    for name, secret in fields.items():
+        quoted = json.dumps({name: secret + ' "private" \\ tail', "safe": "visible-neighbor"})
+        escaped_name = f"\\u{ord(name[0]):04x}" + name[1:]
+        escaped = quoted.replace(name, escaped_name)
+        assignments.extend((f"{name}={secret}", f"'{name}'='{secret}'", f"'{escaped_name}'='{secret}'",
+                            quoted, escaped, json.dumps(escaped), json.dumps(escaped)[1:-1], json.dumps({"detail": escaped}),
+                            json.dumps({"detail": f"Cookie: first={secret}; second={secret}"})))
+    neighbors = "safe_neighbor=visible-neighbor monkey=visible-neighbor tokenizer=visible-neighbor"
+    message = "\n".join(assignments) + "\n" + neighbors
+    url = "https://example.com/?" + "&".join(f"%{ord(name[0]):02x}{name[1:]}={secret}" for name, secret in fields.items()) + "&q=visible-neighbor"
+    payload = {"objective": message, "fields": fields, "source": url, "safe": "visible-neighbor"}
+    events = Events(root)
+    store = ModelTraces(root, events)
+    captured = StringIO()
+    with redirect_stderr(captured), fake_cli(root, "redaction"):
+        events.emit("assignment_redaction", message=message, fields=fields, source=url, safe="visible-neighbor")
+        with store.open(AttemptKey("assignment-redaction", "audit"), payload, model.PLAN_SCHEMA, model.MODEL_PROMPT) as attempt:
+            result = model.run_codex(payload, lambda _: None, attempt=attempt)
+    assert result == {"rationale": message, "actions": []}
+    record = json.loads(attempt.path.read_bytes())
+    event = json.loads((events.root / "events.jsonl").read_bytes().splitlines()[0])
+    artifacts = (captured.getvalue(), (events.root / "events.jsonl").read_text(), attempt.path.read_text())
+    assert all(secret not in artifact for secret in fields.values() for artifact in artifacts)
+    for stored in (record["input"], event):
+        assert stored["fields"] == dict.fromkeys(names, "[REDACTED]") and stored["safe"] == "visible-neighbor"
+        assert stored["source"].endswith("&q=visible-neighbor")
+    for stored in (record["stdin"], record["raw"]["text"], record["stderr"]["text"], event["message"]):
+        assert all(name in stored for name in names) and neighbors in stored
+    assert record["response"]["actions"] == [] and record["outcome"] == "validated"
 
 
 def check_cli(directory):
@@ -257,6 +312,19 @@ def check_cli(directory):
     record = json.loads(attempt.path.read_text())
     assert record["cli"]["error_type"] == "FileNotFoundError" and record["raw"]["total_bytes"] == 0
     assert not Path(record["command"][record["command"].index("--cd") + 1]).exists()
+    attempt = store.open(AttemptKey("missing-cli-storage-failed", "audit"), {}, model.PLAN_SCHEMA, model.MODEL_PROMPT)
+    original_popen = model.subprocess.Popen
+    original_failures = []
+    def break_storage_on_launch_error(*args, **kwargs):
+        try:
+            return original_popen(*args, **kwargs)
+        except FileNotFoundError as exc:
+            original_failures.append(exc)
+            break_traces(store.root)
+            raise
+    with patch("model.codex_path", return_value=str(root / "nonexistent-cli")), patch("model.subprocess.Popen", side_effect=break_storage_on_launch_error):
+        assert fails(missing, FileNotFoundError) is original_failures[0]
+    assert not Path(attempt.record["command"][attempt.record["command"].index("--cd") + 1]).exists()
 
 
 def check_engine_failures(directory, base):
@@ -414,6 +482,18 @@ def check_http(directory, base):
         assert len(reports[0]["message"]) == 2000 and len(reports[0]["issue_path"]) == 300 and len(reports[0]["stack"]) == 4000
         assert "secret-browser-token" not in json.dumps(records)
         assert re.fullmatch(r"[0-9a-f]{16}", reports[0]["reporting_request_id"])
+        with server.REPORT_LOCK:
+            server.REPORT_TIMES.clear()
+        unicode_report = {**report, "message": "café 😀 boom " + chr(0xD800), "stack": "frame " + chr(0xDFFF)}
+        status, reporting_id, result = request("/api/client-errors", unicode_report,
+                                               {"X-Wirewatch-Request": "fedcba9876543210"})
+        assert status == 200 and result == {"ok": True} and reporting_id == "fedcba9876543210"
+        lines = (engine.events.root / "events.jsonl").read_bytes().splitlines()
+        unicode_line = next(line for line in lines if json.loads(line).get("message") == unicode_report["message"])
+        stored = json.loads(unicode_line)
+        assert stored["event"] == "client_error" and stored["request_id"] == report["request_id"]
+        assert stored["reporting_request_id"] == reporting_id and stored["stack"] == unicode_report["stack"]
+        assert "café 😀".encode("utf-8") in unicode_line and b"\\ud800" in unicode_line and b"\\udfff" in unicode_line
         status, request_id, result = request("/api/replay", {"scan_id": scan_id})
         deadline = time.monotonic() + 2
         while True:
@@ -436,6 +516,7 @@ def run(directory, base):
     root.mkdir()
     check_existing_sources(root, base)
     check_storage(root)
+    check_assignment_redaction(root)
     check_cli(root)
     check_engine_failures(root, base)
     check_rejections(root, base)

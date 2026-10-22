@@ -29,16 +29,64 @@ _ACTIVE: set[Path] = set()
 _SECRET = re.compile(r"authorization|cookie|password|passwd|secret|credential|(?:^|[_-])(?:token|api[_-]?key|access[_-]?key|key|auth|signature|sig|session[_-]?id)(?:$|[_-])|^(?:access|refresh|id)Token$", re.I)
 _URL = re.compile(r"https?://[^\s<>\"']+", re.I)
 _BEARER = re.compile(r"\bBearer\s+[^\s,;\"']+", re.I)
-_ASSIGNMENT = re.compile(r"(\b(?:authorization|(?:set-)?cookie|password|passwd|secret|(?:access[_-]?|refresh[_-]?|api[_-]?)?token|api[_-]?key|access[_-]?key)\b[\"']?\s*[:=]\s*)([\"'][^\"'\r\n]*[\"']|[^\s,;}&]+)", re.I)
+_QUOTED = (r'\\"(?:\\\\(?:\\.|[^"\\])|[^"\\\r\n])*\\"'
+           r'|"(?:\\.|[^"\\\r\n])*"'
+           r"|'(?:\\.|[^'\\\r\n])*'")
+_ASSIGNMENT = re.compile(
+    rf'''(?<![\w.-])(?:(?P<prefix>(?P<name>{_QUOTED}|[\w.-]+)\s*[:=]\s*)'''
+    rf'''(?P<value>{_QUOTED}|[^\s,;{{}}\[\]&]+)|(?P<quoted>{_QUOTED}))''')
 _HEADER = re.compile(r"(?<![\"'])\b(authorization|(?:set-)?cookie)\s*[:=]\s*[^\r\n]*", re.I)
 _CREDENTIAL = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{8,}|gh[pousr]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]+|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b")
+
+
+def _sensitive_name(name: str) -> bool:
+    return _SECRET.search(name) is not None
+
+
+def _unquote(value: str) -> str:
+    if value.startswith(r'\"'):
+        value = json.loads('"' + value + '"')
+    if value[0] == "'":
+        value = '"' + re.sub(r'\\.|"', lambda match: {"\\'": "'", '"': '\\"'}.get(match[0], match[0]), value[1:-1]) + '"'
+    return json.loads(value)
+
+
+def _redact_assignment(match: re.Match[str]) -> str:
+    name = match["name"]
+    prefix = match["prefix"] or ""
+    value = match["value"] or match["quoted"]
+    quote = value[0] if len(value) >= 2 and value[0] in ('"', "'") and value[-1] == value[0] else ""
+    if value.startswith(r'\"') and value.endswith(r'\"'):
+        quote = r'\"'
+    if name is not None:
+        if name.startswith(('"', "'", r'\"')):
+            try:
+                name = _unquote(name)
+            except json.JSONDecodeError:
+                pass
+        if _sensitive_name(name):
+            return prefix + quote + "[REDACTED]" + quote
+    decoded = value
+    if quote:
+        try:
+            decoded = _unquote(value)
+        except json.JSONDecodeError:
+            return match[0]
+    clean = str(redact(decoded))
+    if clean == decoded:
+        return match[0]
+    if quote:
+        clean = json.dumps(clean, ensure_ascii=False)
+        if quote == r'\"':
+            clean = json.dumps(clean, ensure_ascii=False)[1:-1]
+    return prefix + clean
 
 
 def _url(match: re.Match[str]) -> str:
     try:
         parts = urlsplit(match.group())
         host = parts.netloc.rsplit("@", 1)[-1]
-        query = "&".join(part.partition("=")[0] + "=%5BREDACTED%5D" if _SECRET.search(unquote_plus(part.partition("=")[0])) else part
+        query = "&".join(part.partition("=")[0] + "=%5BREDACTED%5D" if _sensitive_name(unquote_plus(part.partition("=")[0])) else part
                          for part in parts.query.split("&"))
         return urlunsplit((parts.scheme, host, parts.path, query, parts.fragment))
     except ValueError:
@@ -47,14 +95,14 @@ def _url(match: re.Match[str]) -> str:
 
 def redact(value: object) -> object:
     if isinstance(value, dict):
-        return {str(key): "[REDACTED]" if _SECRET.search(str(key)) else redact(item) for key, item in value.items()}
+        return {str(key): "[REDACTED]" if _sensitive_name(str(key)) else redact(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [redact(item) for item in value]
     if isinstance(value, str):
         value = _URL.sub(_url, value)
         value = _BEARER.sub("Bearer [REDACTED]", value)
         value = _HEADER.sub(lambda match: match[1] + "=[REDACTED]", value)
-        value = _ASSIGNMENT.sub(lambda match: match[1] + (match[2][0] + "[REDACTED]" + match[2][0] if match[2][0] in ('"', "'") else "[REDACTED]"), value)
+        value = _ASSIGNMENT.sub(_redact_assignment, value)
         return _CREDENTIAL.sub("[REDACTED]", value)
     if value is None or isinstance(value, (bool, int, float)):
         return value
@@ -66,7 +114,7 @@ def text(value: str, limit: int) -> str:
 
 
 def encoded(value: object) -> bytes:
-    return json.dumps(redact(value), ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
+    return json.dumps(redact(value), ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8", errors="backslashreplace")
 
 
 def _record(event: str, level: str, fields: dict[str, object]) -> bytes:

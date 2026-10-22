@@ -433,11 +433,11 @@ def _drain(fd: int, capture: Captured) -> None:
         capture.add(chunk)
 
 
-def _invoke(command: list[str], prompt: str, output: Path, captures: dict[str, Captured]) -> tuple[int, bool]:
-    os.mkfifo(output, mode=0o600)
+def _invoke(command: list[str], prompt: str, last_message_fifo: Path, captures: dict[str, Captured]) -> tuple[int, bool]:
+    os.mkfifo(last_message_fifo, mode=0o600)
     with selectors.PollSelector() as selector:
-        raw = os.open(output, os.O_RDONLY | os.O_NONBLOCK)
-        anchor = os.open(output, os.O_WRONLY | os.O_NONBLOCK)
+        raw = os.open(last_message_fifo, os.O_RDONLY | os.O_NONBLOCK)
+        anchor = os.open(last_message_fifo, os.O_WRONLY | os.O_NONBLOCK)
         process = None
         try:
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -503,6 +503,16 @@ def _invoke(command: list[str], prompt: str, output: Path, captures: dict[str, C
             os.close(raw)
 
 
+def _retain_failed_invocation(attempt: ModelAttempt, failure: BaseException, *, started: float,
+                              captures: dict[str, Captured]) -> None:
+    try:
+        attempt.save(stage="cli", cli={"error_type": type(failure).__name__, "error": str(failure),
+                     "duration_ms": round((time.monotonic() - started) * 1000)},
+                     **{key: capture.evidence() for key, capture in captures.items()})
+    except Exception:
+        pass
+
+
 def run_codex(payload: dict[str, object], progress: Callable[[str], None], *, attempt: ModelAttempt,
               schema: dict[str, object] | None = None, system_prompt: str | None = None) -> dict[str, object]:
     binary = codex_path()
@@ -512,21 +522,16 @@ def run_codex(payload: dict[str, object], progress: Callable[[str], None], *, at
     progress("Codex is reading the complete context and planning tools")
     with TemporaryDirectory(prefix="wirewatch-codex-") as directory:
         schema_path = Path(directory) / "schema.json"
-        output = Path(directory) / "plan.json"
+        last_message_fifo = Path(directory) / "plan.json"
         schema_path.write_text(json.dumps(PLAN_SCHEMA if schema is None else schema))
-        command = [binary, "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "--ignore-user-config", "-c", 'cli_auth_credentials_store="file"', "--cd", directory, "--output-schema", str(schema_path), "--output-last-message", str(output), "--color", "never", "-"]
+        command = [binary, "exec", "--ephemeral", "--sandbox", "read-only", "--skip-git-repo-check", "--ignore-user-config", "-c", 'cli_auth_credentials_store="file"', "--cd", directory, "--output-schema", str(schema_path), "--output-last-message", str(last_message_fifo), "--color", "never", "-"]
         attempt.save(stage="cli", stdin=prompt, command=command)
         started = time.monotonic()
         captured = {"stdout": Captured(STREAM_BYTES), "stderr": Captured(STREAM_BYTES), "raw": Captured(RAW_BYTES)}
         try:
-            returncode, timed_out = _invoke(command, prompt, output, captured)
+            returncode, timed_out = _invoke(command, prompt, last_message_fifo, captured)
         except BaseException as exc:
-            try:
-                attempt.save(stage="cli", cli={"error_type": type(exc).__name__, "error": str(exc),
-                             "duration_ms": round((time.monotonic() - started) * 1000)},
-                             **{key: capture.evidence() for key, capture in captured.items()})
-            except Exception:
-                pass
+            _retain_failed_invocation(attempt, exc, started=started, captures=captured)
             raise
         failure = None
         if timed_out:
