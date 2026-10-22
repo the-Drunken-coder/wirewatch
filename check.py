@@ -21,6 +21,7 @@ import time
 import model
 import server
 import setup_review as review
+from diagnostics import AttemptKey
 from engine import Engine, SCHEMA
 from model import Rules, ScanWindow, Validators, discovery, evaluate, fetch_conditional, parse_feed, publication_time, query_url
 
@@ -135,7 +136,7 @@ def setup_plan(topic, url):
         {"tool": "subscribe_feed", "scan_ref": "new", "feed_url": url, "rationale": "Requested source"}]}
 
 
-def no_op(payload, progress):
+def no_op(payload, progress, **kwargs):
     return {"rationale": "Reviewed all supplied records", "actions": []}
 
 
@@ -624,7 +625,7 @@ def check_plans(directory, base):
     for index, window in enumerate(({}, WINDOW)):
         name = f"Custom model {index}"
         engine.enqueue("setup", {"topic": name, "objective": "Objective", "feed_urls": [base + "/atom"], **window})
-        def plan(payload, progress):
+        def plan(payload, progress, **kwargs):
             assert payload["user_feed_urls"] == [base + "/atom"]
             assert base + "/atom" in {f["url"] for f in payload["discovery"]}
             assert payload["preview"][0]["title"] == "Battery research"
@@ -635,7 +636,7 @@ def check_plans(directory, base):
         assert scan["mode"] == window.get("mode", "live")
     rejected(lambda: engine.enqueue("setup", {"topic": "Invalid", "objective": "Objective", "mode": "historical"}))
     engine.enqueue("setup", {"topic": "Stale", "objective": "Objective", "feed_urls": [url]})
-    def stale(payload, progress):
+    def stale(payload, progress, **kwargs):
         temporary = create(engine, "Transient", url)
         engine.delete_scan({"scan_id": temporary})
         return setup_plan("Stale", url)
@@ -673,7 +674,7 @@ def check_lanes(directory, base, routes):
     engine.update_scan({"scan_id": paused, "status": "paused"})
     entered, release = Event(), Event()
     engine.enqueue("setup", {"topic": "Blocked setup", "objective": "Objective", "feed_urls": [url]})
-    def blocked(payload, progress):
+    def blocked(payload, progress, **kwargs):
         entered.set()
         assert release.wait(8), "Model fixture was never released"
         return setup_plan("Blocked setup", url)
@@ -734,7 +735,7 @@ def check_audits(directory, base, requests):
         assert engine.run_next("model") and engine.run_next("model")
     assert all(j["status"] == "cancelled" for j in engine.state()["jobs"] if j["id"] in {p["id"] for p in pending.values()})
     calls, network = [], len(requests)
-    def review(payload, progress):
+    def review(payload, progress, **kwargs):
         calls.append(payload)
         assert payload["mode"] == "decision_audit" and len(payload["history"]) == 2 and len(payload["decisions"]) == 2
         assert {d["kept"] for d in payload["decisions"]} == {True, False}
@@ -766,7 +767,7 @@ def check_audits(directory, base, requests):
     with engine.transaction() as db:
         db.execute("DELETE FROM decisions WHERE article_id=1")
         db.execute("UPDATE decisions SET reasons='[\"Wrong reason\"]' WHERE article_id=2")
-    def repair(payload, progress):
+    def repair(payload, progress, **kwargs):
         assert payload["report"]["missing_count"] == payload["report"]["inconsistent_count"] == 1
         return {"rationale": "Repair deterministic gaps", "actions": [{"tool": "replay_history", "scan_ref": str(scan_id), "rationale": "Re-evaluate all history"}]}
     with patch("engine.run_codex", side_effect=repair):
@@ -786,8 +787,12 @@ def check_audits(directory, base, requests):
         history = [dict(row) for row in db.execute("SELECT * FROM articles ORDER BY id")]
     payload, _ = engine._decision_context(engine.state(), history)
     assert payload["report"]["missing_count"] == 0, "Paused gaps were reported as missing"
-    with patch("model.codex_path", return_value="unused"), patch("model.subprocess.run", side_effect=AssertionError("Oversized review invoked Codex")):
-        rejected(lambda: model.run_codex({"history": "x" * model.MAX_MODEL_BYTES}, lambda _: None))
+    def oversized():
+        payload = {"history": "x" * model.MAX_MODEL_BYTES}
+        with engine.traces.open(AttemptKey("oversized-check", "decision_audit"), payload, model.PLAN_SCHEMA, model.MODEL_PROMPT) as attempt:
+            return model.run_codex(payload, lambda _: None, attempt=attempt)
+    with patch("model.codex_path", return_value="unused"), patch("model.subprocess.Popen", side_effect=AssertionError("Oversized review invoked Codex")):
+        rejected(oversized)
     assert engine.state()["settings"]["audit_interval_minutes"] == 17
     with engine.transaction() as db:
         db.execute("UPDATE articles SET summary=? WHERE id=1", ("x" * model.MAX_MODEL_BYTES,))
@@ -1257,7 +1262,7 @@ def check_setup_limits(directory, base):
         if initial:
             engine = Engine(directory / "setup-13-calls.sqlite3", start_worker=False)
             job_id = engine.enqueue("setup", {"topic": "Automatic bounded setup", "objective": "Objective", "feed_urls": [base + "/rss"]})
-            def initial_plan(payload, progress):
+            def initial_plan(payload, progress, **kwargs):
                 with engine.transaction() as db:
                     assert json.loads(db.execute("SELECT payload FROM jobs WHERE id=?", (job_id,)).fetchone()[0])["cli_calls_used"] == 1
                 return setup_plan("Automatic bounded setup", base + "/rss")
@@ -1602,6 +1607,7 @@ def check_setup_poll_race(directory, base, routes):
 
 def main():
     logging.disable(logging.CRITICAL)
+    from check_diagnostics import run as diagnostic_checks
     check_parsing()
     with TemporaryDirectory() as directory, feeds() as (base, routes, requests):
         path = Path(directory)
@@ -1633,6 +1639,7 @@ def main():
         check_setup_google_probes(path, base)
         check_setup_dense_bounds()
         check_setup_poll_race(path, base, routes)
+        diagnostics = diagnostic_checks(path, base)
     print(json.dumps({"result": "PASS", "checks": ["RSS and Atom", "unsafe URL rejection", "deterministic decisions", "rule replay", "immutable decision activity", "subscription idempotence", "plan rollback", "audit scan idempotence and inheritance", "stale editor rejection", "restart persistence", "UTC date windows and unknown dates", "finite historical scheduling and manual rerun", "historical setup enforcement", "historical audit inheritance", "queued and inflight deletion", "durable IDs", "stale plan rejection after deletion", "old database migration", "HTTP API and asset safety", "200 and conditional 304", "shared URL deduplication", "Retry-After seconds and HTTP dates", "durable backoff and recovery", "resume and new subscriber cache", "pause removal and ID reuse races", "collection and replay during blocked model", "bounded fetch fairness", "interrupted deterministic recovery", "zero interrupted model retries", "queued model runs once", "atomic accepted creation and downstream requests", "custom feeds in both setup modes", "independent audits off and scheduling", "complete decision audit and diagnostics", "unchanged scheduled decision skips", "decision tools restricted", "partial settings", "historical JSON export", "finite historical diagnostic eligibility", "bounded model context", "inflight 200 and 304 cache races", "atomic model bookkeeping rollback", "cross-source live archive and zero audit gaps", "paused and historical arrival exclusion", "shared arrival status and subscription races", "current arrival rules and subscription additions", "post-body replay requests and final revisions", "running and requeued replay restart", "coalesced replay deletion", "stale source token before fetch",
         "full 1800-record UTF8 review with long URLs, 20 queries and late discarded miss", "live and historical source convergence and probe windows",
         "mandatory independent probes and every ready gate", "page output action finding and context limits",
@@ -1641,7 +1648,7 @@ def main():
         "collector replay and unrelated edits during blocked setup review", "jobs CHECK migration preserves rows and indexes",
         "historical arrivals during collection reach frozen replay", "new source poll survives cancellation of old poll",
         "jobs migration exception and process crash rollback", "late lane and resumed deterministic work get bounded settling",
-        "dated Google probe canonicalization and conservative independence", "lossless dense rows six 100-item probes and exact UTF8 boundaries"]}))
+        "dated Google probe canonicalization and conservative independence", "lossless dense rows six 100-item probes and exact UTF8 boundaries", *diagnostics]}))
 
 
 if __name__ == "__main__":

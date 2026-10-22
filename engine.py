@@ -8,14 +8,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Literal
 import json
-import logging
 import hashlib
 import sqlite3
 import threading
 import time
+import traceback
 import uuid
 
-from model import (COLLECTION_INTERVAL_SECONDS, FeedHTTPError, Rules, ScanWindow, Validators,
+from diagnostics import AttemptKey, Events, ModelTraces, Rejected
+from model import (MODEL_PROMPT, PLAN_SCHEMA, COLLECTION_INTERVAL_SECONDS, FeedHTTPError, Rules, ScanWindow, Validators,
     codex_path, discovery, evaluate, feed_urls, fetch_conditional, fetch_feed, minutes, next_check_delay,
     now, publication_time, query_url, required_text, run_codex, safe_url)
 import setup_review as review
@@ -127,6 +128,9 @@ def timestamp(value: float) -> str:
 class Engine:
     def __init__(self, database: Path, start_worker: bool = True) -> None:
         self.database = database
+        self.events = Events(database.parent)
+        self.traces = ModelTraces(database.parent, self.events)
+        self.events.emit("app_starting")
         database.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
@@ -178,11 +182,14 @@ class Engine:
             db.execute("UPDATE audits SET status='failed', finished_at=?, error='Server stopped during model work; not retried' WHERE status='running'", (now(),))
             for scan in db.execute("SELECT id FROM scans WHERE mode='historical' AND completed_at IS NULL AND status='active'").fetchall():
                 self._enqueue(db, "poll", {"scan_id": scan["id"]}, "schedule")
+        self.events.emit("archive_recovered", interrupted_reviews=len(interrupted), model_retry=False)
+        self.events.emit("archive_migrated", outcome="ready")
         self.worker = threading.Thread(target=self._loop, name="wirewatch-collector", daemon=True)
         self.model_worker = threading.Thread(target=self._model_loop, name="wirewatch-model", daemon=True)
         if start_worker:
             self.worker.start()
             self.model_worker.start()
+        self.events.emit("app_started", workers=start_worker)
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -285,6 +292,8 @@ class Engine:
             if before != self._setup_hash(db, scan_id):
                 self._invalidate_setup(db, scan_id, "Scan subscriptions changed; restart setup review")
             self._enqueue(db, "poll", {"scan_id": scan_id}, "user")
+        self.events.emit("scan_created", scan_id=scan_id, feed_count=len(feeds), mode=window.mode)
+        self.events.emit("feeds_saved", scan_id=scan_id, feed_urls=feeds)
         return scan_id
 
     def _decide(self, db: sqlite3.Connection, scan: sqlite3.Row, article: sqlite3.Row, rules: Rules) -> None:
@@ -341,6 +350,12 @@ class Engine:
             if before != self._setup_hash(db, scan_id):
                 self._invalidate_setup(db, scan_id, "Scan configuration changed or paused; restart setup review")
 
+        self.events.emit("scan_updated", scan_id=scan_id, fields=sorted(data), status=data.get("status"))
+        if "rules" in data:
+            self.events.emit("rules_saved", scan_id=scan_id, term_counts={key: len(value) for key, value in data["rules"].items()})
+        if "feed_url" in data or "remove_feed_id" in data:
+            self.events.emit("feeds_saved", scan_id=scan_id, feed_url=data.get("feed_url"), removed_feed_id=data.get("remove_feed_id"))
+
     def delete_scan(self, data: dict[str, object]) -> None:
         scan_id = self._id(data.get("scan_id"))
         with self.transaction() as db:
@@ -352,6 +367,8 @@ class Engine:
             db.execute("DELETE FROM feeds WHERE scan_id=?", (scan_id,))
             db.execute("DELETE FROM scans WHERE id=?", (scan_id,))
             db.execute("UPDATE jobs SET status='cancelled',message='Scan deleted',finished_at=? WHERE scan_id=? AND status IN ('queued','running')", (now(), scan_id))
+
+        self.events.emit("scan_deleted", scan_id=scan_id, outcome="cancelled_pending_jobs")
 
     @staticmethod
     def _id(value: object) -> int:
@@ -374,6 +391,8 @@ class Engine:
                 db.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(value), key))
             self.activity(db, "settings", "Audit settings saved", details=settings)
 
+        self.events.emit("settings_saved", **{key: value for key, value in settings.items() if key != "audit_objective"})
+
     def _enqueue(self, db: sqlite3.Connection, kind: JobKind, data: dict[str, object], origin: str, strict: bool = False) -> str:
         key = kind if kind in ("setup", "audit", "decision_audit") else f"{kind}:{data.get('scan_id')}"
         if kind == "setup_review":
@@ -386,10 +405,12 @@ class Engine:
                 payload = json.loads(existing["payload"])
                 payload["rerun_requested"] = True
                 db.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(payload), existing["id"]))
+            self.events.emit("job_coalesced", "DEBUG", job_id=existing["id"], kind=kind, origin=origin, scan_id=data.get("scan_id"), outcome="pending_commit")
             return existing["id"]
         job_id = uuid.uuid4().hex[:12]
         db.execute("INSERT INTO jobs VALUES (?,?,?,?,?,?,'queued','Waiting for the worker',?,NULL)",
             (job_id, key, kind, data.get("scan_id"), json.dumps(data), origin, datetime.now(timezone.utc).isoformat()))
+        self.events.emit("job_enqueued", job_id=job_id, kind=kind, origin=origin, scan_id=data.get("scan_id"), run_id=data.get("run_id"), round=data.get("round"), outcome="pending_commit")
         return job_id
 
     def enqueue(self, kind: JobKind, data: dict[str, object] | None = None) -> str:
@@ -411,6 +432,8 @@ class Engine:
     def progress(self, job_id: str, message: str, **values: object) -> None:
         with self.transaction() as db:
             self._progress(db, job_id, message, **values)
+
+        self.events.emit("job_progress", job_id=job_id, message=message, **values)
 
     def _progress(self, db: sqlite3.Connection, job_id: str, message: str, **values: object) -> None:
         status = values.get("status")
@@ -441,10 +464,13 @@ class Engine:
             job = DurableJob(**{**dict(row), "payload": json.loads(row["payload"])})
             if job.origin == "schedule" and job.kind in ("audit", "decision_audit") and not self.settings(db)[f"{job.kind}_enabled"]:
                 self._progress(db, job.id, "Scheduled audit disabled", status="cancelled", finished_at=now())
+                self.events.emit("job_cancelled", job_id=job.id, kind=job.kind, reason="scheduled_audit_disabled", outcome="pending_commit")
                 return True
             self._progress(db, job.id, "Starting", status="running")
             if job.kind in ("poll", "replay") and job.payload.pop("rerun_requested", False):
                 db.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(job.payload), job.id))
+        started = time.monotonic()
+        self.events.emit("job_claimed", lane=lane, job_id=job.id, kind=job.kind, origin=job.origin, scan_id=job.scan_id, run_id=job.payload.get("run_id"), round=job.payload.get("round"))
         try:
             if job.kind == "poll":
                 self._poll(int(job.payload["scan_id"]), job.id)
@@ -458,7 +484,8 @@ class Engine:
                 with self.transaction() as db:
                     self._finish_deterministic(db, job)
         except Exception as exc:
-            logging.exception("%s job failed", job.kind)
+            self.events.emit("job_failed", "ERROR", lane=lane, job_id=job.id, kind=job.kind, scan_id=job.scan_id,
+                             run_id=job.payload.get("run_id"), round=job.payload.get("round"), error_type=type(exc).__name__, error=str(exc), stack=traceback.format_exc(limit=8), duration_ms=round((time.monotonic() - started) * 1000))
             with self.transaction() as db:
                 if job.kind == "setup_review":
                     self._fail_setup(db, job, str(exc))
@@ -467,30 +494,45 @@ class Engine:
                 else:
                     self._progress(db, job.id, str(exc), status="failed", finished_at=now())
                 self.activity(db, "job_error", f"{job.kind} failed: {exc}", details={"job_id": job.id})
+        with self.transaction() as db:
+            status = db.execute("SELECT status FROM jobs WHERE id=?", (job.id,)).fetchone()[0]
+        self.events.emit("job_finished", job_id=job.id, kind=job.kind, scan_id=job.scan_id, outcome=status, duration_ms=round((time.monotonic() - started) * 1000))
         return True
 
     def _loop(self) -> None:
-        # Reserve collection capacity even when an explicit poll checks many slow feeds.
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="wirewatch-feed") as executor:
-            explicit = automatic = None
-            while not self.stop_event.is_set():
-                for future in (explicit, automatic):
-                    if future is not None and future.done():
-                        try:
-                            future.result()
-                        except Exception:
-                            logging.exception("Collector work failed")
-                if explicit is None or explicit.done():
-                    explicit = executor.submit(self.run_next, "collector")
-                if automatic is None or automatic.done():
-                    automatic = executor.submit(self.collect_due)
-                self._schedule()
-                self.stop_event.wait(0.2)
+        try:
+            # Reserve collection capacity even when an explicit poll checks many slow feeds.
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="wirewatch-feed") as executor:
+                explicit = automatic = None
+                while not self.stop_event.is_set():
+                    for future in (explicit, automatic):
+                        if future is not None and future.done():
+                            try:
+                                future.result()
+                            except Exception as exc:
+                                self.events.emit("collector_failed", "ERROR", error_type=type(exc).__name__, error=str(exc), stack=traceback.format_exc(limit=8))
+                    if explicit is None or explicit.done():
+                        explicit = executor.submit(self.run_next, "collector")
+                    if automatic is None or automatic.done():
+                        automatic = executor.submit(self.collect_due)
+                    self._schedule()
+                    self.stop_event.wait(0.2)
+        except Exception as exc:
+            self.events.emit("worker_stopped", "ERROR", lane="collector", error=str(exc))
+            raise
+        finally:
+            self.events.emit("worker_stopped", lane="collector")
 
     def _model_loop(self) -> None:
-        while not self.stop_event.is_set():
-            if not self.run_next("model"):
-                self.stop_event.wait(0.2)
+        try:
+            while not self.stop_event.is_set():
+                if not self.run_next("model"):
+                    self.stop_event.wait(0.2)
+        except Exception as exc:
+            self.events.emit("worker_stopped", "ERROR", lane="model", error=str(exc))
+            raise
+        finally:
+            self.events.emit("worker_stopped", lane="model")
 
     def _schedule(self) -> None:
         with self.transaction() as db:
@@ -544,7 +586,14 @@ class Engine:
                     if scan["mode"] == "historical":
                         db.execute("UPDATE scans SET archive_through_id=? WHERE id=?", (through, scan_id))
                     self.activity(db, "replay", f"Replayed {count} stored articles at revision {revision}", scan_id, ScanWindow.parse(dict(scan)).to_dict())
-                    return True
+                    decision_count, kept_count = db.execute("SELECT count(*),coalesce(sum(kept),0) FROM decisions WHERE scan_id=?", (scan_id,)).fetchone()
+                    completed = True
+                else:
+                    completed = False
+            if completed:
+                self.events.emit("replay_completed", scan_id=scan_id, article_count=count, revision=revision, archive_through_id=through,
+                                 decision_count=decision_count, kept_count=kept_count, discarded_count=decision_count - kept_count)
+                return True
 
     @staticmethod
     def _subscriptions_current(db: sqlite3.Connection, scan: sqlite3.Row, subscriptions: list[dict[str, object]] | None) -> bool:
@@ -580,6 +629,9 @@ class Engine:
                     break
             if self.stop_event.wait(0.05):
                 return "Server stopped before feed check"
+        started = time.monotonic()
+        diagnostic: dict[str, object] = {"outcome": "discarded"}
+        self.events.emit("feed_fetch_started", "DEBUG", feed_url=url, scan_id=for_scan)
         try:
             try:
                 result = fetch_conditional(url, state.validators)
@@ -604,6 +656,7 @@ class Engine:
                         db.execute("UPDATE feeds SET last_checked=?,error=? WHERE id=?", (now(), error, sub["id"]))
                         if state.failures == 0:
                             self.activity(db, "feed_error", f"{url}: {error}", sub["scan_id"])
+                    diagnostic = {"outcome": "backoff", "error": error, "failures": failures, "retry_at": floor, "next_check_at": max(current + next_check_delay(failures), floor)}
                     return error
                 articles = result.articles
                 inserted = 0
@@ -620,6 +673,7 @@ class Engine:
                     if inserted or state.failures:
                         self.activity(db, "feed_polled", f"Fetched {len(articles or [])} items from {url}" if not state.failures else f"Feed recovered: {url}", sub["scan_id"])
                 arrivals = [db.execute("SELECT * FROM articles WHERE stable_key=?", (article.stable_key,)).fetchone() for article in articles or []]
+                decision_counts = []
                 for scan_id, status_token, subscriptions in targets:
                     scan = db.execute("SELECT * FROM scans WHERE id=?", (scan_id,)).fetchone()
                     if scan is None or scan["status"] != "active" or scan["status_token"] != status_token:
@@ -634,10 +688,19 @@ class Engine:
                         stored_articles = arrivals
                     for stored in stored_articles:
                         self._decide(db, scan, stored, rules)
+                    decision_count, kept_count = db.execute("SELECT count(*),coalesce(sum(kept),0) FROM decisions WHERE scan_id=?", (scan_id,)).fetchone()
+                    decision_counts.append({"scan_id": scan_id, "decision_count": decision_count,
+                                            "kept_count": kept_count, "discarded_count": decision_count - kept_count})
+                diagnostic = {"outcome": "recovered" if state.failures else "changed" if inserted else "unchanged",
+                              "item_count": len(articles or []), "inserted_count": inserted,
+                              "scan_count": len(targets), "not_modified": articles is None, "decisions": decision_counts}
                 return None
         finally:
             with self.transaction() as db:
                 db.execute("UPDATE feed_state SET claimed=0 WHERE url=?", (url,))
+            outcome = diagnostic["outcome"]
+            self.events.emit("feed_fetch_finished", "WARNING" if outcome == "backoff" else "DEBUG" if outcome in ("unchanged", "discarded") else "INFO",
+                             feed_url=url, scan_id=for_scan, duration_ms=round((time.monotonic() - started) * 1000), **diagnostic)
 
     def _poll(self, scan_id: int, job_id: str) -> None:
         with self.transaction() as db:
@@ -718,6 +781,8 @@ class Engine:
         db.execute("UPDATE jobs SET status=?,finished_at=?,message=? WHERE kind='setup_review' AND scan_id=? AND status IN ('queued','running')",
             ("failed" if round_status == "failed" else "cancelled", now(), reason, scan_id))
         self.activity(db, "setup_review", reason, scan_id, {"run_id": run["run_id"], "phase": phase})
+        self.events.emit("setup_phase_changed", scan_id=scan_id, run_id=run["run_id"], round=run["round"],
+                         phase=phase, round_status=round_status, reason=reason, outcome="pending_commit")
 
     def control_setup_review(self, data: dict[str, object]) -> None:
         scan_id = self._id(data.get("scan_id"))
@@ -730,6 +795,8 @@ class Engine:
                 self._invalidate_setup(db, scan_id, "Setup review stopped; collection continues", phase="stopped", round_status="cancelled")
             else:
                 self._start_setup(db, scan_id)
+            state = self._setup_state(db, scan_id)
+        self.events.emit("setup_control", scan_id=scan_id, action=action, run_id=state["run_id"] if state else None, phase=state["phase"] if state else None)
 
     def _start_setup(self, db: sqlite3.Connection, scan_id: int, initial_calls: int = 0) -> None:
         scan = self.scan(db, scan_id)
@@ -758,6 +825,8 @@ class Engine:
             (current, current + review.COLLECT_SECONDS, current + review.COLLECT_SECONDS + review.SETTLE_SECONDS,
              json.dumps(work), self._setup_hash(db, scan_id), run_id))
         self._enqueue(db, "setup_review", {"scan_id": scan_id, "run_id": run_id, "round": run["round"]}, "model")
+        self.events.emit("setup_phase_changed", scan_id=scan_id, run_id=run_id, round=run["round"], phase="collecting",
+                         next_review_at=current + review.COLLECT_SECONDS, outcome="pending_commit")
 
     def _setup_current(self, db: sqlite3.Connection, job: DurableJob) -> sqlite3.Row | None:
         run = db.execute("SELECT * FROM setup_runs WHERE scan_id=? ORDER BY rowid DESC LIMIT 1", (job.scan_id,)).fetchone()
@@ -822,6 +891,8 @@ class Engine:
             pending = json.loads(run["pending_probes"])
             window = ScanWindow.parse(dict(self.scan(db, job.scan_id)))
         for request in pending:
+            started = time.monotonic()
+            self.events.emit("setup_probe_started", job_id=job.id, scan_id=job.scan_id, run_id=job.payload["run_id"], round=job.payload["round"], feed_url=request["url"])
             with self.transaction() as db:
                 if self._setup_current(db, job) is None:
                     return False
@@ -843,6 +914,7 @@ class Engine:
                 remaining = json.loads(run["pending_probes"])[1:]
                 db.execute("UPDATE setup_runs SET probes=?,pending_probes=? WHERE run_id=?",
                     (json.dumps(probes, ensure_ascii=False), json.dumps(remaining), run["run_id"]))
+            self.events.emit("setup_probe_finished", "WARNING" if error else "INFO", job_id=job.id, scan_id=job.scan_id, run_id=job.payload["run_id"], round=job.payload["round"], probe_id=probes[-1]["id"], item_count=len(articles), error=error, duration_ms=round((time.monotonic() - started) * 1000))
         return True
 
     def _setup_evidence(self, db: sqlite3.Connection, scan: sqlite3.Row, highwater: int,
@@ -912,33 +984,51 @@ class Engine:
         seen_probes = {ident for finding in carry for ident in finding["probe_ids"]}
         rationales = []
         reviewed = 0
+        self.events.emit("setup_round_started", job_id=job.id, scan_id=job.scan_id, run_id=job.payload["run_id"],
+                         round=job.payload["round"], page_count=len(pages), **report)
         for number, page in enumerate(pages, 1):
             payload = review.context(metadata, page, number, len(pages), carry)
-            with self.transaction() as db:
-                run = self._setup_current(db, job)
+            key = AttemptKey(job.id, job.kind, job.scan_id, job.payload["run_id"], job.payload["round"], number)
+            with self.traces.open(key, payload, review.SCHEMA, review.PROMPT) as attempt:
+                with self.transaction() as db:
+                    run = self._setup_current(db, job)
+                    if run is not None:
+                        if run["calls_used"] >= run["call_limit"]:
+                            raise ValueError("Setup CLI invocation limit reached before invocation")
+                        db.execute("UPDATE setup_runs SET calls_used=calls_used+1 WHERE run_id=?", (run["run_id"],))
+                        db.execute("UPDATE setup_rounds SET calls_used=calls_used+1 WHERE run_id=? AND round=? AND finished_at IS NULL", (run["run_id"], run["round"]))
                 if run is None:
+                    attempt.save(stage="stale_snapshot", outcome="stale")
                     return
-                if run["calls_used"] >= run["call_limit"]:
-                    raise ValueError("Setup CLI invocation limit reached before invocation")
-                db.execute("UPDATE setup_runs SET calls_used=calls_used+1 WHERE run_id=?", (run["run_id"],))
-                db.execute("UPDATE setup_rounds SET calls_used=calls_used+1 WHERE run_id=? AND round=? AND finished_at IS NULL", (run["run_id"], run["round"]))
-            result = run_codex(payload, lambda message: self.progress(job.id, message), schema=review.SCHEMA, system_prompt=review.PROMPT)
-            seen_articles.update(item["article_id"] for item in page if item["type"] == "decision")
-            seen_probes.update(item["id"] if item["type"] == "probe" else item["probe_id"] for item in page if item["type"] in ("probe", "probe_article"))
-            output = review.parse_page(result, number, number == len(pages), carry, seen_articles, seen_probes)
-            carry = output.findings
-            rationales.append(f"Page {number}\n{output.rationale}")
-            reviewed += sum(item["type"] == "decision" for item in page)
-            with self.transaction() as db:
-                if self._setup_current(db, job) is None:
+                result = run_codex(payload, lambda message: self.progress(job.id, message), attempt=attempt,
+                                   schema=review.SCHEMA, system_prompt=review.PROMPT)
+                seen_articles.update(item["article_id"] for item in page if item["type"] == "decision")
+                seen_probes.update(item["id"] if item["type"] == "probe" else item["probe_id"] for item in page if item["type"] in ("probe", "probe_article"))
+                attempt.save(stage="page_validation", response=result,
+                             validation={"supplied_article_ids": sorted(seen_articles), "supplied_probe_ids": sorted(seen_probes), "carried_findings": carry})
+                output = review.parse_page(result, number, number == len(pages), carry, seen_articles, seen_probes)
+                carry = output.findings
+                rationales.append(f"Page {number}\n{output.rationale}")
+                reviewed += sum(item["type"] == "decision" for item in page)
+                attempt.save(stage="application" if number == len(pages) else "page_accepted")
+                with self.transaction() as db:
+                    current = self._setup_current(db, job)
+                    if current is not None:
+                        db.execute("UPDATE setup_runs SET reviewed_count=? WHERE run_id=?", (reviewed, job.payload["run_id"]))
+                        db.execute("UPDATE setup_rounds SET reviewed_count=?,rationale=?,findings=? WHERE run_id=? AND round=? AND finished_at IS NULL",
+                            (reviewed, "\n\n".join(rationales), json.dumps(carry, ensure_ascii=False), job.payload["run_id"], job.payload["round"]))
+                        if number == len(pages):
+                            current = self._setup_current(db, job)
+                            self._apply_setup_round(db, job, current, output, carry, probes, allowed, report)
+                if current is None:
+                    attempt.save(stage="stale_snapshot", outcome="stale")
                     return
-                db.execute("UPDATE setup_runs SET reviewed_count=? WHERE run_id=?", (reviewed, job.payload["run_id"]))
-                db.execute("UPDATE setup_rounds SET reviewed_count=?,rationale=?,findings=? WHERE run_id=? AND round=? AND finished_at IS NULL",
-                    (reviewed, "\n\n".join(rationales), json.dumps(carry, ensure_ascii=False), job.payload["run_id"], job.payload["round"]))
-        with self.transaction() as db:
-            run = self._setup_current(db, job)
-            if run is not None:
-                self._apply_setup_round(db, job, run, output, carry, probes, allowed, report)
+                if number == len(pages):
+                    attempt.committed = True
+            self.events.emit("setup_page_accepted", job_id=job.id, scan_id=job.scan_id, run_id=key.run_id,
+                             round=key.round, page=number, attempt_id=attempt.id, reviewed_count=reviewed)
+        self.events.emit("setup_round_applied", job_id=job.id, scan_id=job.scan_id, run_id=key.run_id, round=key.round,
+                         action_count=len(output.actions), finding_count=len(carry))
 
     def _apply_setup_round(self, db: sqlite3.Connection, job: DurableJob, run: sqlite3.Row,
                            output: review.PageResult, findings: list[dict[str, object]], probes: list[dict[str, object]],
@@ -946,12 +1036,14 @@ class Engine:
         scan = self.scan(db, job.scan_id)
         feeds = {row[0] for row in db.execute("SELECT url FROM feeds WHERE scan_id=?", (job.scan_id,))}
         scoped = review.parse_actions(output.actions, Rules.parse(json.loads(scan["rules"])), feeds, allowed, ScanWindow.parse(dict(scan)))
-        prior_sources = {review.probe_source(prior["url"]) for prior in probes}
+        prior_sources = {review.source_identity(prior["url"]) for prior in probes}
         if any(review.probe_source(probe["url"]) in prior_sources for probe in scoped.probes):
-            raise ValueError("A new probe must use a fresh URL/query, not repeat an executed probe")
+            raise Rejected("A new probe must use a fresh URL/query, not repeat an executed probe", path="actions.probes",
+                           expected="fresh source identity", received=scoped.probes, prior_sources=sorted(prior_sources), stage="scoped_validation")
         independent = any(probe["independent"] and probe["error"] is None and probe["in_window_count"] > 0 for probe in probes)
         if not independent and not any(probe["independent"] for probe in scoped.probes):
-            raise ValueError("Review must request a fresh independent probe before stability can be assessed")
+            raise Rejected("Review must request a fresh independent probe before stability can be assessed", path="actions.probes",
+                           expected="a fresh independent probe or successful inspected independent evidence", received=scoped.probes, stage="scoped_validation")
         self._update_rules(db, job.scan_id, scoped.rules)
         for url in feeds - scoped.feeds:
             db.execute("DELETE FROM feeds WHERE scan_id=? AND url=?", (job.scan_id, url))
@@ -1108,28 +1200,35 @@ class Engine:
                             db.execute("UPDATE audits SET status='failed',finished_at=?,error='Scheduled audit disabled before model execution' WHERE id=?", (now(), audit_id))
                         self._progress(db, job_id, "Scheduled audit disabled", status="cancelled", finished_at=now())
                         return
-            if kind == "setup":
-                with self.transaction() as db:
-                    reserved = db.execute("SELECT status,payload FROM jobs WHERE id=?", (job_id,)).fetchone()
-                    if reserved["status"] != "running":
-                        return
-                    reserved_payload = json.loads(reserved["payload"])
-                    reserved_payload["cli_calls_used"] = 1
-                    db.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(reserved_payload), job_id))
-            plan = run_codex(payload, lambda message: self.progress(job_id, message))
-            self.progress(job_id, "Validating and applying tool plan atomically")
-            with self.transaction() as db:
-                existing_ids = {row[0] for row in db.execute("SELECT id FROM scans")}
-                self._apply_plan(db, plan, feed_options, kind, str(objective), expected,
-                    ScanWindow.parse(data) if kind == "setup" else None, deletion_id, setup_urls)
+            with self.traces.open(AttemptKey(job_id, kind, audit_id=audit_id), payload, PLAN_SCHEMA, MODEL_PROMPT) as attempt:
                 if kind == "setup":
-                    for scan_id in {row[0] for row in db.execute("SELECT id FROM scans")} - existing_ids:
-                        self._start_setup(db, scan_id, initial_calls=1)
-                self.activity(db, "model_plan", str(plan["rationale"]), details=plan["actions"])
-                if audit_id is not None:
-                    db.execute("UPDATE audits SET status='completed',finished_at=?,rationale=?,actions=?,input_hash=? WHERE id=?",
-                        (now(), plan["rationale"], json.dumps(plan["actions"]), digest, audit_id))
-                self._progress(db, job_id, "Completed", status="completed", finished_at=now())
+                    with self.transaction() as db:
+                        reserved = db.execute("SELECT status,payload FROM jobs WHERE id=?", (job_id,)).fetchone()
+                        if reserved["status"] == "running":
+                            reserved_payload = json.loads(reserved["payload"])
+                            reserved_payload["cli_calls_used"] = 1
+                            db.execute("UPDATE jobs SET payload=? WHERE id=?", (json.dumps(reserved_payload), job_id))
+                    if reserved["status"] != "running":
+                        attempt.save(stage="stale_snapshot", outcome="stale")
+                        return
+                plan = run_codex(payload, lambda message: self.progress(job_id, message), attempt=attempt)
+                attempt.save(stage="application", response=plan, validation={"expected_snapshot": expected, "expected_deletion_id": deletion_id})
+                self.progress(job_id, "Validating and applying tool plan atomically")
+                with self.transaction() as db:
+                    existing_ids = {row[0] for row in db.execute("SELECT id FROM scans")}
+                    self._apply_plan(db, plan, feed_options, kind, str(objective), expected,
+                        ScanWindow.parse(data) if kind == "setup" else None, deletion_id, setup_urls)
+                    if kind == "setup":
+                        for scan_id in {row[0] for row in db.execute("SELECT id FROM scans")} - existing_ids:
+                            self._start_setup(db, scan_id, initial_calls=1)
+                    self.activity(db, "model_plan", str(plan["rationale"]), details=plan["actions"])
+                    if audit_id is not None:
+                        db.execute("UPDATE audits SET status='completed',finished_at=?,rationale=?,actions=?,input_hash=? WHERE id=?",
+                            (now(), plan["rationale"], json.dumps(plan["actions"]), digest, audit_id))
+                    self._progress(db, job_id, "Completed", status="completed", finished_at=now())
+                attempt.committed = True
+            self.events.emit("model_plan_applied", job_id=job_id, attempt_id=attempt.id, kind=kind,
+                             audit_id=audit_id, action_count=len(plan["actions"]))
         except Exception as exc:
             if audit_id is not None:
                 with self.transaction() as db:
@@ -1150,70 +1249,77 @@ class Engine:
     def _apply_plan(self, db: sqlite3.Connection, plan: dict[str, object], discovery_feeds: list[dict[str, str]], kind: str, objective: str,
                     expected: dict[int, tuple[object, ...]] | None, setup_window: ScanWindow | None,
                     expected_deletion_id: int | None, setup_urls: list[str] | None = None) -> set[int]:
-        rationale = required_text(plan.get("rationale"), "Plan rationale", 20000)
+        try:
+            rationale = required_text(plan.get("rationale"), "Plan rationale", 20000)
+        except ValueError as exc:
+            raise Rejected(str(exc), path="rationale", expected="nonempty text, at most 20000 characters", received=plan.get("rationale")) from exc
         actions = plan.get("actions")
         if not isinstance(actions, list) or len(actions) > 24:
-            raise ValueError("Model plan requires at most 24 actions")
+            raise Rejected("Model plan requires at most 24 actions", path="actions", expected="array, at most 24 actions", received=actions)
         affected: set[int] = set()
         setup_hashes = {row[0]: self._setup_hash(db, row[0]) for row in db.execute("SELECT id FROM scans").fetchall()}
         aliases: dict[str, int] = {}
         if expected_deletion_id is not None and db.execute("SELECT coalesce(max(id),0) FROM activity WHERE type='scan_deleted'").fetchone()[0] != expected_deletion_id:
-            raise ValueError("A scan was deleted while Codex was planning. No tools applied; run the job again")
+            raise Rejected("A scan was deleted while Codex was planning. No tools applied; run the job again", path="snapshot.deletion_id", expected=expected_deletion_id, received=db.execute("SELECT coalesce(max(id),0) FROM activity WHERE type='scan_deleted'").fetchone()[0], stage="stale_snapshot")
         if expected is not None:
             scans = [{**dict(s), "feeds": [dict(f) for f in db.execute("SELECT url,token FROM feeds WHERE scan_id=? ORDER BY id", (s["id"],))]} for s in db.execute("SELECT * FROM scans")]
             actual = self._snapshot(scans)
             if actual != expected:
-                raise ValueError("Scans changed while Codex was planning. No tools applied; run the job again")
+                raise Rejected("Scans changed while Codex was planning. No tools applied; run the job again", path="snapshot.scans", expected=expected, received=actual, stage="stale_snapshot")
         allowed_urls = {safe_url(feed["url"]) for feed in discovery_feeds}
         allowed_urls.update(row["url"] for row in db.execute("SELECT url FROM feeds"))
-        for action in actions:
-            if not isinstance(action, dict):
-                raise ValueError("Tool actions must be objects")
-            tool = action.get("tool")
-            if kind == "decision_audit" and tool not in ("update_scan", "replay_history"):
-                raise ValueError("Decision audits may only update rules and replay existing scans")
-            ref = required_text(action.get("scan_ref"), "scan_ref", 100)
-            reason = required_text(action.get("rationale"), "Tool rationale", 5000)
-            if tool == "create_scan":
-                if ref.isdecimal() or ref in aliases:
-                    raise ValueError("New scans need a unique nonnumeric alias")
-                topic = required_text(action.get("topic"), "Topic", 300)
-                scan_objective = objective if kind in ("audit", "decision_audit") else required_text(action.get("objective"), "Objective")
-                window = (setup_window or ScanWindow()) if kind == "setup" else ScanWindow()
-                source_ref = action.get("source_scan_ref")
-                if source_ref is not None:
-                    if kind != "audit" or not isinstance(source_ref, str) or not source_ref.isdecimal():
-                        raise ValueError("Historical audit creation requires an existing numeric source_scan_ref")
-                    window = ScanWindow.parse(dict(self.scan(db, int(source_ref))))
-                    if window.mode != "historical":
-                        raise ValueError("source_scan_ref must identify a historical scan")
-                if kind == "audit" and any(key in action and action[key] != value for key, value in window.to_dict().items()):
-                    raise ValueError("Audit-created dates must inherit source_scan_ref exactly")
-                scan_id = self._create(db, topic, scan_objective, Rules.parse(action.get("rules")), minutes(5 if action.get("poll_interval_minutes") is None else action["poll_interval_minutes"]), window)
-                aliases[ref] = scan_id
-            else:
-                scan_id = aliases.get(ref) or (int(ref) if ref.isdecimal() else 0)
-                scan = self.scan(db, scan_id)
-                if kind == "setup" and ScanWindow.parse(dict(scan)) != (setup_window or ScanWindow()):
-                    raise ValueError("Setup tools cannot target a scan with another mode or date window")
-                if any(key in action and action[key] != scan[key] for key in ("mode", "start_date", "end_date")):
-                    raise ValueError("Model tools cannot change a scan's mode or date window")
-                if tool == "update_scan":
-                    interval = action.get("poll_interval_minutes")
-                    self._update_rules(db, scan_id, Rules.parse(action.get("rules")), minutes(interval) if interval is not None else None)
-                elif tool == "subscribe_feed":
-                    url = safe_url(action.get("feed_url"))
-                    if kind == "setup" and setup_urls is not None and url not in setup_urls:
-                        raise ValueError("Setup must use the requested custom feeds or default topic search")
-                    if url not in allowed_urls:
-                        raise ValueError("Model selected a feed outside the supplied discovery catalog")
-                    self._subscribe(db, scan_id, url)
-                elif tool == "replay_history":
-                    self._enqueue(db, "replay", {"scan_id": scan_id}, "model")
+        for index, action in enumerate(actions):
+            try:
+                if not isinstance(action, dict):
+                    raise ValueError("Tool actions must be objects")
+                tool = action.get("tool")
+                if kind == "decision_audit" and tool not in ("update_scan", "replay_history"):
+                    raise ValueError("Decision audits may only update rules and replay existing scans")
+                ref = required_text(action.get("scan_ref"), "scan_ref", 100)
+                reason = required_text(action.get("rationale"), "Tool rationale", 5000)
+                if tool == "create_scan":
+                    if ref.isdecimal() or ref in aliases:
+                        raise ValueError("New scans need a unique nonnumeric alias")
+                    topic = required_text(action.get("topic"), "Topic", 300)
+                    scan_objective = objective if kind in ("audit", "decision_audit") else required_text(action.get("objective"), "Objective")
+                    window = (setup_window or ScanWindow()) if kind == "setup" else ScanWindow()
+                    source_ref = action.get("source_scan_ref")
+                    if source_ref is not None:
+                        if kind != "audit" or not isinstance(source_ref, str) or not source_ref.isdecimal():
+                            raise ValueError("Historical audit creation requires an existing numeric source_scan_ref")
+                        window = ScanWindow.parse(dict(self.scan(db, int(source_ref))))
+                        if window.mode != "historical":
+                            raise ValueError("source_scan_ref must identify a historical scan")
+                    if kind == "audit" and any(key in action and action[key] != value for key, value in window.to_dict().items()):
+                        raise ValueError("Audit-created dates must inherit source_scan_ref exactly")
+                    scan_id = self._create(db, topic, scan_objective, Rules.parse(action.get("rules")), minutes(5 if action.get("poll_interval_minutes") is None else action["poll_interval_minutes"]), window)
+                    aliases[ref] = scan_id
                 else:
-                    raise ValueError(f"Unknown tool: {tool}")
-            affected.add(scan_id)
-            self.activity(db, "model_tool", f"{tool}: {reason}", scan_id, {**action, **ScanWindow.parse(dict(self.scan(db, scan_id))).to_dict()})
+                    scan_id = aliases.get(ref) or (int(ref) if ref.isdecimal() else 0)
+                    scan = self.scan(db, scan_id)
+                    if kind == "setup" and ScanWindow.parse(dict(scan)) != (setup_window or ScanWindow()):
+                        raise ValueError("Setup tools cannot target a scan with another mode or date window")
+                    if any(key in action and action[key] != scan[key] for key in ("mode", "start_date", "end_date")):
+                        raise ValueError("Model tools cannot change a scan's mode or date window")
+                    if tool == "update_scan":
+                        interval = action.get("poll_interval_minutes")
+                        self._update_rules(db, scan_id, Rules.parse(action.get("rules")), minutes(interval) if interval is not None else None)
+                    elif tool == "subscribe_feed":
+                        url = safe_url(action.get("feed_url"))
+                        if kind == "setup" and setup_urls is not None and url not in setup_urls:
+                            raise ValueError("Setup must use the requested custom feeds or default topic search")
+                        if url not in allowed_urls:
+                            raise ValueError("Model selected a feed outside the supplied discovery catalog")
+                        review.probe_source(url)
+                        self._subscribe(db, scan_id, url)
+                    elif tool == "replay_history":
+                        self._enqueue(db, "replay", {"scan_id": scan_id}, "model")
+                    else:
+                        raise ValueError(f"Unknown tool: {tool}")
+                affected.add(scan_id)
+                self.activity(db, "model_tool", f"{tool}: {reason}", scan_id, {**action, **ScanWindow.parse(dict(self.scan(db, scan_id))).to_dict()})
+            except ValueError as exc:
+                raise Rejected(str(exc), path=f"actions[{index}]", expected="valid authorized tool action", received=action, stage="plan_validation") from exc
         if kind == "setup" and (not aliases or not any(db.execute("SELECT 1 FROM feeds WHERE scan_id=?", (scan_id,)).fetchone() for scan_id in aliases.values())):
             raise ValueError("Setup must create a scan and subscribe a feed. No tools applied")
         if kind == "setup" and setup_urls is not None:

@@ -10,7 +10,7 @@ This is a single-user prototype. The implementation is submitted separately from
 
 Collection works independently of model work. Autonomous setup can tune rules and feeds, but it is not yet reliable: a real run stopped during verification when its model response failed evidence-reference validation. It did not reach Ready.
 
-**Logging is the next priority.** Activity history does not capture enough diagnostic detail across the application, and rejected model responses are not retained. That gap must be addressed before the setup failure can be diagnosed reliably.
+Structured local diagnostics now record application, request, collection, job, and model failures. Private bounded model traces retain inputs and rejected outputs. The earlier evidence-reference failure discarded its response and cannot be reconstructed retrospectively. Its cause is still unverified.
 
 ## Run with Docker
 
@@ -50,9 +50,19 @@ python3 server.py --port 8765
 python3 check.py
 ```
 
-The checks use temporary databases and local feed fixtures. They stub the model boundary and make no real Codex calls. Docker builds the UI itself.
+The checks use temporary databases, local feed fixtures, and fake CLI subprocesses. They make no real Codex calls. Docker builds the UI itself.
 
 The implementation includes `docs/reference.md` with API details, lifecycle rules, persistence behavior, and prototype limits.
+
+## Local diagnostics
+
+Events go to stderr and `<archive directory>/diagnostics/events.jsonl`. Files rotate at 5 MB with four backups. `WIREWATCH_LOG_LEVEL=DEBUG` includes successful state and health polling and unchanged feed checks.
+
+Model traces live in the private `diagnostics/traces` directory beside the archive. They retain successful inputs as well as rejected responses, up to 50 completed attempts or 128 MB. They contain objectives and news text. Directories use mode `0700`, files use `0600`, and common credentials are redacted. These files are excluded from Git and Docker builds and have no HTTP download route. Docker keeps them in the existing `archive` volume.
+
+If required trace input cannot be saved, model work stops before reserving a call. Ordinary logging failures do not stop collection. A diagnostic failure after a successful application commit reports uncertainty without failing or retrying the completed work. Existing business activity remains in SQLite independently.
+
+The [reference](docs/reference.md#local-diagnostics) describes retention, correlation, and the browser error endpoint.
 
 ## Limits
 

@@ -1,0 +1,450 @@
+"""Executable diagnostics boundaries using temporary files, HTTP and fake CLI processes."""
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager, redirect_stderr
+from http.server import ThreadingHTTPServer
+from io import StringIO
+from pathlib import Path
+from threading import Thread
+from unittest.mock import patch
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+import json
+import os
+import re
+import sqlite3
+import stat
+import sys
+import time
+
+import diagnostics
+from diagnostics import AttemptKey, Events, ModelTraces, Rejected
+from engine import Engine
+import model
+import server
+import setup_review as review
+
+RULES = {"any_terms": [], "all_terms": [], "exclude_terms": []}
+
+
+def fails(action, error=ValueError):
+    try:
+        action()
+    except error as exc:
+        return exc
+    raise AssertionError("Invalid boundary operation succeeded")
+
+
+def drain(engine):
+    for _ in range(100):
+        if not engine.run_next("collector"):
+            return
+    raise AssertionError("Collector did not settle")
+
+
+def fixture(path, base):
+    path.mkdir()
+    engine = Engine(path / "archive.sqlite3", start_worker=False)
+    scan_id = engine.create_scan({"topic": path.name, "objective": "Retain the complete test evidence", "rules": RULES,
+                                  "feed_urls": [base + "/rss"]})
+    drain(engine)
+    return engine, scan_id
+
+
+def review_turn(engine, scan_id, boundary):
+    engine.control_setup_review({"scan_id": scan_id, "action": "start"})
+    drain(engine)
+    at = model.publication_time(engine.setup_history(scan_id)["next_review_at"]).timestamp() + 1
+    with patch("engine.time.time", return_value=at), patch("engine.run_codex", side_effect=boundary) as calls:
+        assert not engine.run_next("model")
+        drain(engine)
+        assert engine.run_next("model")
+    return calls
+
+
+def trace_records(engine):
+    return [json.loads(path.read_text()) for path in engine.traces.root.glob("*.json")]
+
+
+def break_traces(root):
+    root.rename(root.with_name(root.name + "-retained"))
+    root.write_text("Storage became unavailable")
+
+
+def check_existing_sources(directory, base):
+    malformed = ["https://news.google.com/rss/search", "https://news.google.com/rss/search?q=",
+                 "https://news.google.com/rss/search?q=one&q=two", "https://news.google.com/rss/search?q=one&q=",
+                 model.query_url("after:2026-01-01 before:2026-01-02")]
+    for url in malformed:
+        assert review.source_identity(url) == model.safe_url(url)
+        assert review.parse_actions([], model.Rules.parse(RULES), {url}, {url}, model.ScanWindow()).feeds == {url}
+        for window in (model.ScanWindow(), model.ScanWindow.parse({"mode": "historical", "start_date": "2026-01-01", "end_date": "2026-01-02"})):
+            for tool in ("probe_feed", "add_feed"):
+                action = {"tool": tool, "rules": None, "feed_url": url, "query": None, "rationale": "Test strict new sources"}
+                fails(lambda: review.parse_actions([action], model.Rules.parse(RULES), {base + "/rss"}, {url}, window))
+        engine, scan_id = fixture(directory / f"malformed-{len(list(directory.iterdir()))}", base)
+        with engine.transaction() as db:
+            db.execute("UPDATE feeds SET url=? WHERE scan_id=?", (url, scan_id))
+            db.execute("INSERT OR IGNORE INTO feed_state(url,next_check_at) VALUES (?,0)", (url,))
+        engine.apply_plan({"rationale": "An empty plan remains valid", "actions": []}, [], "audit", "Fixture")
+        def empty(payload, progress, **kwargs):
+            return {"page_number": payload["page_number"], "rationale": "No changes", "stable": False, "findings": [], "actions": []}
+        engine.control_setup_review({"scan_id": scan_id, "action": "start"})
+        probe = {"id": 1, "url": base + "/atom", "query": None, "independent": True,
+                 "articles": [{**article.__dict__, "window_reason": None} for article in model.fetch_feed(base + "/atom")],
+                 "item_count": 1, "in_window_count": 1, "error": None, "executed_at": model.now()}
+        with engine.transaction() as db:
+            db.execute("UPDATE setup_runs SET probes=? WHERE scan_id=?", (json.dumps([probe]), scan_id))
+        with patch("engine.fetch_conditional", return_value=model.FeedFetch([], model.Validators())):
+            review_turn(engine, scan_id, empty)
+        trace = trace_records(engine)[0]
+        assert trace["outcome"] == "applied" and "error" not in trace
+        assert trace["response"]["actions"] == []
+        assert all(job["status"] == "completed" for job in engine.state()["jobs"] if job["kind"] == "setup_review")
+    valid = model.query_url("(" + "term " * 350 + ") after:2026-01-01 before:2026-01-02")
+    assert review.source_identity(valid) == review.probe_source(valid)
+    fails(lambda: review.source_identity("https://user:secret@example.com/"))
+
+
+def check_storage(directory):
+    path = directory / "storage"
+    path.mkdir()
+    events = Events(path)
+    secret = "secret-fixture-token"
+    events.emit("redaction", nested={"authorization": secret, "api_key": secret, "accessToken": secret},
+                message=f"Bearer {secret} https://user:{secret}@example.com/rss?api_key={secret}&q=visible")
+    store = ModelTraces(path, events)
+    with store.open(AttemptKey("job", "audit"), {"objective": "Private success input", "nested": {"cookie": secret}}, {}, "Instructions") as attempt:
+        attempt.save(raw={"text": f"Authorization: Bearer {secret}"})
+    literal = "https://example.com/rss?q=hello%20world&q=two&hl=en-US"
+    assert diagnostics.redact(literal) == literal
+    assert secret not in str(diagnostics.redact("Cookie: session=" + secret + "; other=" + secret))
+    assert secret not in str(diagnostics.redact("https://example.com/?key=" + secret + "&accessToken=" + secret))
+    data = attempt.path.read_text()
+    assert "Private success input" in data and secret not in data
+    assert secret not in (events.root / "events.jsonl").read_text()
+    for root in (events.root, store.root):
+        assert stat.S_IMODE(root.stat().st_mode) == 0o700
+    for target in (attempt.path, events.root / "events.jsonl"):
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    oversized = fails(lambda: store.open(AttemptKey("large", "audit"), {"input": "x" * 4_000_000}, {}, ""), RuntimeError)
+    assert "No model call" in str(oversized)
+    active = store.open(AttemptKey("active", "audit"), {"important": "active"}, {}, "")
+    def retain(index):
+        with store.open(AttemptKey(str(index), "audit"), {"index": index}, {}, ""):
+            pass
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        list(pool.map(retain, range(56)))
+    assert active.path.exists() and len(list(store.root.glob("*.json"))) == 51
+    active.__exit__(None, None, None)
+    assert len(list(store.root.glob("*.json"))) == 50
+    assert all(json.loads(target.read_text())["outcome"] == "validated" for target in store.root.glob("*.json"))
+    orphan = store.root / "interrupted-write.tmp"
+    orphan.write_text("x" * 2000)
+    orphan.chmod(0o600)
+    with patch("diagnostics.TRACE_TOTAL_BYTES", 1600):
+        with store.open(AttemptKey("byte-bound", "audit"), {"input": "x" * 600}, {}, "") as bounded:
+            pass
+        assert sum(target.stat().st_size for target in store.root.glob("*.json")) <= 1600
+        assert bounded.path.exists() and not orphan.exists()
+    with patch("diagnostics.LOG_BYTES", 1200):
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            list(pool.map(lambda i: events.emit("parallel", index=i, message="é" * 100), range(100)))
+    logs = list(events.root.glob("events.jsonl*"))
+    assert len(logs) == 5
+    for target in logs:
+        assert target.stat().st_size <= 1200 and stat.S_IMODE(target.stat().st_mode) == 0o600
+        for line in target.read_bytes().splitlines():
+            assert json.loads(line)["event"] == "parallel"
+    events.emit("bounded", message="é" * 20_000, nested=["x" * 20_000] * 3)
+    line = (events.root / "events.jsonl").read_bytes().splitlines()[-1]
+    assert len(line) + 1 <= 16_384 and json.loads(line)["truncated"]
+    victim = path / "victim"
+    victim.write_text("unchanged")
+    (events.root / "events.jsonl").unlink()
+    (events.root / "events.jsonl").symlink_to(victim)
+    events.emit("unsafe_event_target")
+    assert victim.read_text() == "unchanged"
+    traces = path / "unsafe"
+    traces.mkdir()
+    (traces / "diagnostics").symlink_to(events.root, target_is_directory=True)
+    unsafe = ModelTraces(traces, Events(traces))
+    fails(lambda: unsafe.open(AttemptKey("unsafe", "audit"), {}, {}, ""), RuntimeError)
+    with store.open(AttemptKey("preserve-original", "audit"), {}, {}, "") as original:
+        original.save(stage="page_validation")
+    attempt = store.open(AttemptKey("failed-finalization", "audit"), {}, {}, "")
+    break_traces(store.root)
+    exception = Rejected("Original rejection", path="findings[2].article_ids", expected=[1], received=[9])
+    def reject():
+        with attempt:
+            raise exception
+    assert fails(reject) is exception
+
+
+@contextmanager
+def fake_cli(directory, mode):
+    path = directory / f"fake-codex-{mode}"
+    path.write_text("#!" + sys.executable + "\n" + '''import json, os, pathlib, stat, sys, time
+args = sys.argv
+output = pathlib.Path(args[args.index("--output-last-message") + 1])
+assert stat.S_ISFIFO(output.stat().st_mode), "CLI output was not bounded by a pipe"
+prompt = sys.stdin.buffer.read()
+sys.stdout.buffer.write(("stdout-prefix pid=" + str(os.getpid()) + "\\n").encode() + b"o" * 90000)
+sys.stdout.flush()
+sys.stderr.buffer.write(b"Authorization: Bearer secret-cli-token\\n" + b"e" * 90000)
+sys.stderr.flush()
+mode = ''' + repr(mode) + '''
+if mode == "nonzero":
+    output.write_text('{"rejected":"nonzero raw response"}')
+    sys.exit(7)
+if mode == "timeout":
+    output.write_text('partial timeout response')
+    print("partial timeout stdout", flush=True)
+    time.sleep(60)
+if mode == "invalid":
+    output.write_text('{"rationale":')
+elif mode == "array":
+    output.write_text('[]')
+elif mode == "oversize":
+    output.write_text("x" * 300000)
+else:
+    output.write_text(json.dumps({"rationale":"Safe fake CLI result", "actions":[]}))
+''')
+    path.chmod(0o700)
+    with patch("model.codex_path", return_value=str(path)):
+        yield
+
+
+def check_cli(directory):
+    root = directory / "cli"
+    root.mkdir()
+    store = ModelTraces(root, Events(root))
+    for mode in ("success", "invalid", "array", "oversize", "nonzero", "timeout"):
+        attempt = store.open(AttemptKey(mode, "audit"), {"objective": "Keep this exact successful input", "token": "secret-input-token"}, model.PLAN_SCHEMA, model.MODEL_PROMPT)
+        error = None
+        with fake_cli(root, mode), patch("model.CODEX_TIMEOUT", 0.5 if mode == "timeout" else 8):
+            try:
+                with attempt:
+                    result = model.run_codex({"objective": "Keep this exact successful input", "token": "secret-input-token"}, lambda _: None, attempt=attempt)
+                    assert result["actions"] == []
+            except (RuntimeError, ValueError) as exc:
+                error = exc
+        assert (error is None) == (mode == "success"), (mode, error)
+        record = json.loads(attempt.path.read_text())
+        assert record["input"]["objective"] == "Keep this exact successful input"
+        assert "secret-cli-token" not in attempt.path.read_text() and "secret-input-token" not in attempt.path.read_text()
+        assert record["stdout"]["total_bytes"] >= 90000 and record["stdout"]["retained_bytes"] == 65536 and record["stdout"]["truncated"]
+        assert record["stderr"]["retained_bytes"] == 65536 and record["stderr"]["truncated"]
+        pid = int(re.search(r"pid=(\d+)", record["stdout"]["text"])[1])
+        fails(lambda: os.kill(pid, 0), ProcessLookupError)
+        temporary = Path(record["command"][record["command"].index("--cd") + 1])
+        assert not temporary.exists(), "CLI temporary directory survived"
+        assert record["stdin"].endswith('"token":"[REDACTED]"}')
+        if mode == "oversize":
+            assert record["raw"]["total_bytes"] == 300000 and record["raw"]["retained_bytes"] == 262144 and record["raw"]["truncated"]
+        if mode == "invalid":
+            assert record["raw"]["text"] == '{"rationale":' and record["error"]["details"]["path"] == "$"
+            assert record["error"]["details"]["offset"] == 13
+        if mode == "timeout":
+            assert record["cli"]["timed_out"] and record["raw"]["text"] == "partial timeout response"
+        if mode == "nonzero":
+            assert record["cli"]["returncode"] == 7 and "nonzero raw response" in record["raw"]["text"]
+
+    attempt = store.open(AttemptKey("missing-cli", "audit"), {}, model.PLAN_SCHEMA, model.MODEL_PROMPT)
+    with patch("model.codex_path", return_value=str(root / "nonexistent-cli")):
+        def missing():
+            with attempt:
+                model.run_codex({}, lambda _: None, attempt=attempt)
+        fails(missing, FileNotFoundError)
+    record = json.loads(attempt.path.read_text())
+    assert record["cli"]["error_type"] == "FileNotFoundError" and record["raw"]["total_bytes"] == 0
+    assert not Path(record["command"][record["command"].index("--cd") + 1]).exists()
+
+
+def check_engine_failures(directory, base):
+    for mode in ("initial", "required", "committed"):
+        engine, scan_id = fixture(directory / f"io-{mode}", base)
+        job_id = engine.enqueue("setup", {"topic": "New scan", "objective": "Fixture", "feed_urls": [base + "/rss"]})
+        def boundary(payload, progress, *, attempt):
+            if mode == "required":
+                break_traces(engine.traces.root)
+            return {"rationale": "An applied scan", "actions": [
+                {"tool": "create_scan", "scan_ref": "new", "topic": "New scan", "objective": "Fixture", "rules": RULES,
+                 "poll_interval_minutes": 5, "rationale": "Create"},
+                {"tool": "subscribe_feed", "scan_ref": "new", "feed_url": base + "/rss", "rationale": "Subscribe"}]}
+        if mode == "initial":
+            engine.traces.root.write_text("Unavailable trace storage")
+        original_connect = sqlite3.connect
+        triggered = []
+        class CommitFailure(sqlite3.Connection):
+            def __exit__(self, *args):
+                result = super().__exit__(*args)
+                if mode == "committed" and args[0] is None and not triggered:
+                    row = self.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+                    if row is not None and row[0] == "completed":
+                        triggered.append(True)
+                        break_traces(engine.traces.root)
+                return result
+        def connect(*args, **kwargs):
+            return original_connect(*args, factory=CommitFailure, **kwargs)
+        captured = StringIO()
+        with redirect_stderr(captured), patch("engine.run_codex", side_effect=boundary) as calls, patch("engine.sqlite3.connect", side_effect=connect):
+            assert engine.run_next("model")
+            assert calls.call_count == (0 if mode == "initial" else 1)
+        state = engine.state()
+        job = next(item for item in state["jobs"] if item["id"] == job_id)
+        assert job["status"] == ("completed" if mode == "committed" else "failed")
+        assert len(state["scans"]) == (2 if mode == "committed" else 1)
+        with engine.transaction() as db:
+            payload = json.loads(db.execute("SELECT payload FROM jobs WHERE id=?", (job_id,)).fetchone()[0])
+        assert payload.get("cli_calls_used", 0) == (0 if mode == "initial" else 1)
+        if mode == "committed":
+            assert triggered and '"event":"model_trace_outcome_unconfirmed"' in captured.getvalue()
+            assert '"application_committed":true' in captured.getvalue()
+        assert not engine.run_next("model"), "Failed or completed model work retried"
+        drain(engine)
+        assert len(engine.state()["records"]) >= 2
+    engine, scan_id = fixture(directory / "review-preflight", base)
+    engine.traces.root.write_text("Unavailable trace storage")
+    calls = review_turn(engine, scan_id, lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Spent without required trace")))
+    assert not calls.called and engine.setup_history(scan_id)["calls_used"] == 0
+    engine, scan_id = fixture(directory / "collector-independent", base)
+    (engine.events.root / "events.jsonl").unlink()
+    engine.events.root.rmdir()
+    engine.events.root.write_text("No diagnostic directory available")
+    engine.enqueue("replay", {"scan_id": scan_id})
+    drain(engine)
+    assert len(engine.state()["records"]) == 2
+
+
+def check_rejections(directory, base):
+    engine, scan_id = fixture(directory / "rejected-page", base)
+    def bad(payload, progress, **kwargs):
+        return {"page_number": payload["page_number"], "rationale": "Rejected raw finding", "stable": False,
+                "findings": [{"id": "f", "article_ids": [999, 999], "probe_ids": [], "reason": "Bad references", "resolved": False}], "actions": []}
+    review_turn(engine, scan_id, bad)
+    record = trace_records(engine)[0]
+    assert record["stage"] == "page_validation" and record["outcome"] == "rejected"
+    assert record["error"]["details"]["path"] == "findings[0].article_ids"
+    assert record["error"]["details"]["bad_refs"] == [999, 999]
+    assert record["error"]["details"]["duplicate_refs"] == [999]
+    assert record["error"]["details"]["expected"] == [1, 2]
+    assert record["response"]["rationale"] == "Rejected raw finding" and record["input"]["source_catalog"]
+    assert record["validation"]["supplied_article_ids"] == [1, 2]
+    assert engine.setup_history(scan_id)["calls_used"] == 1
+    engine, scan_id = fixture(directory / "rejected-application", base)
+    job_id = engine.enqueue("decision_audit")
+    def stale(payload, progress, **kwargs):
+        engine.update_scan({"scan_id": scan_id, "objective": "Changed after model snapshot"})
+        return {"rationale": "A stale plan", "actions": []}
+    with patch("engine.run_codex", side_effect=stale):
+        assert engine.run_next("model")
+    record = trace_records(engine)[0]
+    assert record["error"]["details"]["path"] == "snapshot.scans"
+    assert record["error"]["details"]["stage"] == "stale_snapshot" and record["stage"] == "stale_snapshot"
+    assert engine.state()["audits"][0]["status"] == "failed"
+    engine, scan_id = fixture(directory / "invalid-action", base)
+    engine.enqueue("decision_audit")
+    with patch("engine.run_codex", return_value={"rationale": "Bad plan", "actions": [{"tool": "subscribe_feed"}]}):
+        engine.run_next("model")
+    record = trace_records(engine)[0]
+    assert record["error"]["details"]["path"] == "actions[0]" and record["response"]["actions"] == [{"tool": "subscribe_feed"}]
+    assert record["stage"] == "plan_validation"
+    engine, scan_id = fixture(directory / "rejected-scope", base)
+    def scoped(payload, progress, **kwargs):
+        return {"page_number": payload["page_number"], "rationale": "Invalid scoped change", "stable": False, "findings": [],
+                "actions": [{"tool": "remove_feed", "rules": None, "feed_url": base + "/unsubscribed", "query": None, "rationale": "Outside scope"}]}
+    review_turn(engine, scan_id, scoped)
+    record = trace_records(engine)[0]
+    assert record["stage"] == "scoped_validation" and record["error"]["details"]["path"] == "actions[0].feed_url"
+    assert len(engine.state()["scans"][0]["feeds"]) == 1
+
+
+def check_http(directory, base):
+    engine, scan_id = fixture(directory / "http", base)
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), server.handler_for(engine, 0))
+    httpd.RequestHandlerClass = server.handler_for(engine, httpd.server_port)
+    thread = Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    origin = f"http://127.0.0.1:{httpd.server_port}"
+    def request(path, data=None, headers=None):
+        headers = {"Content-Type": "application/json", "X-Wirewatch": "1", **(headers or {})}
+        body = json.dumps(data).encode() if data is not None and not isinstance(data, bytes) else data
+        try:
+            response = urlopen(Request(origin + path, data=body, headers=headers), timeout=5)
+        except HTTPError as exc:
+            response = exc
+        with response:
+            return response.status, response.headers["X-Wirewatch-Request"], json.loads(response.read())
+    report = {"kind": "schema", "message": "Expected a valid object", "request_id": "0123456789abcdef", "path": "/api/state",
+              "status": 200, "issue_path": "scans.0.rules", "stack": None, "count": 1}
+    try:
+        status, request_id, _ = request("/api/health", headers={"X-Wirewatch-Request": "0123456789abcdef"})
+        assert status == 200 and request_id == "0123456789abcdef"
+        cases = [("/api/state", None, {"Origin": "http://evil.invalid"}, 403),
+                 ("/api/no-such-route", None, {}, 404), ("/api/scans", b"{", {}, 400),
+                 ("/api/settings", {}, {"X-Wirewatch": "0"}, 403),
+                 ("/api/client-errors", b" " * 8193, {}, 413)]
+        for path, data, headers, expected in cases:
+            status, request_id, _ = request(path, data, {"X-Wirewatch-Request": "INVALID", **headers})
+            assert status == expected and re.fullmatch(r"[0-9a-f]{16}", request_id)
+        old = engine.database
+        engine.database = old.parent
+        assert request("/api/state")[0] == 500
+        engine.database = old
+        invalid = [{**report, "extra": "no"}, {key: value for key, value in report.items() if key != "stack"}]
+        for key, values in {"kind": ["unknown", None, []], "message": [None, "", "   ", 7], "request_id": ["bad", 1],
+                            "path": ["relative", "/with?query", "/fragment#x", "/" + "x" * 256, 7],
+                            "status": [True, 99, 600, "200"], "issue_path": [1], "stack": [{}], "count": [True, 0, 1001, "1"]}.items():
+            invalid.extend({**report, key: value} for value in values)
+        for value in invalid:
+            status, request_id, _ = request("/api/client-errors", value)
+            assert status == 400 and re.fullmatch(r"[0-9a-f]{16}", request_id), value
+        with server.REPORT_LOCK:
+            server.REPORT_TIMES.clear()
+        safe = {**report, "message": "Bearer secret-browser-token " + "m" * 2300, "issue_path": "x" * 400, "stack": "s" * 4200}
+        assert request("/api/client-errors", safe)[0] == 200
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            responses = list(pool.map(lambda _: request("/api/client-errors", report), range(30)))
+        assert sum(status == 200 for status, _, _ in responses) == 29
+        assert sum(status == 429 for status, _, _ in responses) == 1
+        with patch("server.time.monotonic", return_value=time.monotonic() + 61):
+            assert request("/api/client-errors", report)[0] == 200
+        records = [json.loads(line) for line in (engine.events.root / "events.jsonl").read_text().splitlines()]
+        reports = [record for record in records if record["event"] == "client_error"]
+        assert len(reports) == 31 and reports[0]["request_id"] == report["request_id"]
+        assert len(reports[0]["message"]) == 2000 and len(reports[0]["issue_path"]) == 300 and len(reports[0]["stack"]) == 4000
+        assert "secret-browser-token" not in json.dumps(records)
+        assert re.fullmatch(r"[0-9a-f]{16}", reports[0]["reporting_request_id"])
+        status, request_id, result = request("/api/replay", {"scan_id": scan_id})
+        deadline = time.monotonic() + 2
+        while True:
+            records = [json.loads(line) for line in (engine.events.root / "events.jsonl").read_text().splitlines()]
+            if any(record.get("request_id") == request_id and record.get("job_id") == result["job_id"] for record in records):
+                break
+            assert time.monotonic() < deadline, "HTTP completion did not retain its returned job ID"
+            time.sleep(0.01)
+        assert request("/diagnostics/events.jsonl")[0] == 404
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
+        with server.REPORT_LOCK:
+            server.REPORT_TIMES.clear()
+
+
+def run(directory, base):
+    root = directory / "diagnostic-checks"
+    root.mkdir()
+    check_existing_sources(root, base)
+    check_storage(root)
+    check_cli(root)
+    check_engine_failures(root, base)
+    check_rejections(root, base)
+    check_http(root, base)
+    return ["malformed accepted feeds and strict new probes", "private successful and rejected trace retention",
+            "concurrent bounded trace retention and JSONL rotation", "redaction permissions and symlink refusal",
+            "fake CLI bounded stdout stderr and raw output", "fake CLI JSON nonzero timeout and temporary cleanup",
+            "trace preflight before initial and page reservations", "required diagnostic failure prevents model effects",
+            "postcommit diagnostic failure preserves completed effects", "original rejection survives diagnostic failure",
+            "rejected evidence paths duplicate refs and stale snapshot details", "collector independence from unavailable diagnostics",
+            "HTTP IDs guards errors strict client reports and locked rate limit"]

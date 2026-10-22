@@ -1,5 +1,6 @@
 **
 !Dockerfile
+!diagnostics.py
 !engine.py
 !model.py
 !setup_review.py
@@ -11,3 +12,4 @@
 **/.env*
 **/auth.json
 **/.codex
+**/diagnostics/

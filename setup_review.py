@@ -5,6 +5,7 @@ import json
 import re
 from urllib.parse import parse_qs, urlsplit
 
+from diagnostics import Rejected
 from model import MAX_MODEL_BYTES, RULE_SCHEMA, Rules, ScanWindow, query_url, required_text, safe_url
 
 
@@ -156,35 +157,47 @@ def parse_page(value: object, number: int, final: bool, previous: list[dict[str,
                article_ids: set[int], probe_ids: set[int]) -> PageResult:
     fields = {"page_number", "rationale", "stable", "findings", "actions"}
     if not isinstance(value, dict) or set(value) != fields or len(encoded(value)) > MAX_OUTPUT_BYTES:
-        raise ValueError("Review response must be a complete bounded page result, at most 80000 bytes")
+        raise Rejected("Review response must be a complete bounded page result, at most 80000 bytes", path="$", expected={"fields": sorted(fields), "max_bytes": MAX_OUTPUT_BYTES}, received={"fields": sorted(value) if isinstance(value, dict) else type(value).__name__, "bytes": len(encoded(value))})
     if type(value["page_number"]) is not int or value["page_number"] != number or type(value["stable"]) is not bool:
-        raise ValueError("Review response has an invalid page number or stable flag")
-    rationale = required_text(value["rationale"], "Page rationale", 12000)
+        raise Rejected("Review response has an invalid page number or stable flag", path="page_number/stable", expected={"page_number": number, "stable": "boolean"}, received={key: value[key] for key in ("page_number", "stable")})
+    try:
+        rationale = required_text(value["rationale"], "Page rationale", 12000)
+    except ValueError as exc:
+        raise Rejected(str(exc), path="rationale", expected="nonempty text, at most 12000 characters", received=value["rationale"]) from exc
     findings = value["findings"]
     if not isinstance(findings, list) or len(findings) > 32 or len(encoded(findings)) > MAX_FINDINGS_BYTES:
-        raise ValueError("Review findings exceed 32 findings or 50000 bytes; no findings may be dropped")
+        raise Rejected("Review findings exceed 32 findings or 50000 bytes; no findings may be dropped", path="findings", expected={"max_count": 32, "max_bytes": MAX_FINDINGS_BYTES}, received=findings)
     ids = set()
-    for finding in findings:
+    for index, finding in enumerate(findings):
         if not isinstance(finding, dict) or set(finding) != {"id", "article_ids", "probe_ids", "reason", "resolved"}:
-            raise ValueError("Invalid review finding")
-        ident = required_text(finding["id"], "Finding id", 80)
+            raise Rejected("Invalid review finding", path=f"findings[{index}]", expected=["id", "article_ids", "probe_ids", "reason", "resolved"], received=finding)
+        try:
+            ident = required_text(finding["id"], "Finding id", 80)
+        except ValueError as exc:
+            raise Rejected(str(exc), path=f"findings[{index}].id", expected="nonempty text, at most 80 characters", received=finding["id"]) from exc
         if ident in ids or type(finding["resolved"]) is not bool:
-            raise ValueError("Duplicate finding id or invalid resolution")
+            raise Rejected("Duplicate finding id or invalid resolution", path=f"findings[{index}].id/resolved", expected="unique id and boolean resolved", received=finding)
         ids.add(ident)
-        required_text(finding["reason"], "Finding reason", 6000)
+        try:
+            required_text(finding["reason"], "Finding reason", 6000)
+        except ValueError as exc:
+            raise Rejected(str(exc), path=f"findings[{index}].reason", expected="nonempty text, at most 6000 characters", received=finding["reason"]) from exc
         for key, allowed in (("article_ids", article_ids), ("probe_ids", probe_ids)):
             refs = finding[key]
             if not isinstance(refs, list) or any(type(ref) is not int or ref not in allowed for ref in refs) or len(refs) != len(set(refs)):
-                raise ValueError("Finding references evidence that has not been supplied")
+                raise Rejected("Finding references evidence that has not been supplied", path=f"findings[{index}].{key}",
+                               expected=sorted(allowed), received=refs,
+                               bad_refs=[ref for ref in refs if type(ref) is not int or ref not in allowed] if isinstance(refs, list) else refs,
+                               duplicate_refs=[ref for i, ref in enumerate(refs) if ref in refs[:i]] if isinstance(refs, list) else [])
     if not {finding["id"] for finding in previous} <= ids:
-        raise ValueError("Review dropped cumulative findings")
+        raise Rejected("Review dropped cumulative findings", path="findings", expected=[finding["id"] for finding in previous], received=sorted(ids))
     actions = value["actions"]
     if not isinstance(actions, list) or len(actions) > 24:
-        raise ValueError("Review supports at most 24 actions")
+        raise Rejected("Review supports at most 24 actions", path="actions", expected="array with at most 24 actions", received=actions)
     if not final and (actions or value["stable"]):
-        raise ValueError("Only the final review page may propose actions or stability")
+        raise Rejected("Only the final review page may propose actions or stability", path="actions/stable", expected={"actions": [], "stable": False}, received={"actions": actions, "stable": value["stable"]})
     if value["stable"] and (actions or any(not finding["resolved"] for finding in findings)):
-        raise ValueError("Stable review cannot have actions or unresolved findings")
+        raise Rejected("Stable review cannot have actions or unresolved findings", path="stable", expected="no actions or unresolved findings", received={"actions": actions, "findings": findings})
     return PageResult(rationale, value["stable"], findings, actions)
 
 
@@ -206,10 +219,11 @@ def probe_url(url: object, window: ScanWindow) -> str:
     result = safe_url(url)
     parts = urlsplit(result)
     if parts.hostname.rstrip(".") == "news.google.com" and parts.path.rstrip("/") == "/rss/search":
-        queries = parse_qs(parts.query).get("q", [])
+        queries = parse_qs(parts.query, keep_blank_values=True).get("q", [])
         if len(queries) != 1:
             raise ValueError("Google probe requires one query")
         query = queries[0].strip()
+        _undated_query(query)
         if window.mode == "historical":
             query = _undated_query(query)
         result = query_url(required_text(query, "Probe query", 4096), window)
@@ -220,11 +234,19 @@ def probe_source(url: str) -> str:
     result = safe_url(url)
     parts = urlsplit(result)
     if parts.hostname.rstrip(".") == "news.google.com" and parts.path.rstrip("/") == "/rss/search":
-        queries = parse_qs(parts.query).get("q", [])
+        queries = parse_qs(parts.query, keep_blank_values=True).get("q", [])
         if len(queries) != 1:
             raise ValueError("Google probe requires one query")
         return query_url(_undated_query(queries[0]))
     return result
+
+
+def source_identity(url: str) -> str:
+    result = safe_url(url)
+    try:
+        return probe_source(result)
+    except ValueError:
+        return result
 
 
 @dataclass(frozen=True)
@@ -239,41 +261,51 @@ def parse_actions(actions: list[dict[str, object]], rules: Rules, feeds: set[str
     probes: list[dict[str, object]] = []
     desired = set(feeds)
     updated_rules = rules
-    for action in actions:
-        if not isinstance(action, dict) or set(action) != {"tool", "rules", "feed_url", "query", "rationale"}:
-            raise ValueError("Invalid scoped setup action")
-        required_text(action["rationale"], "Action rationale", 4000)
-        tool = action["tool"]
-        used = {"rules"} if tool == "update_rules" else {"query"} if tool == "probe_query" else {"feed_url"}
-        if any(action[key] is not None for key in {"rules", "query", "feed_url"} - used):
-            raise ValueError("Scoped action has unsupported fields")
-        if tool == "update_rules":
-            updated_rules = Rules.parse(action["rules"])
-        elif tool in ("add_feed", "remove_feed"):
-            url = safe_url(action["feed_url"])
-            if tool == "add_feed":
-                if url not in allowed:
-                    raise ValueError("New subscriptions require an existing authorized feed or a successfully executed probe")
-                desired.add(url)
+    for index, action in enumerate(actions):
+        field = ""
+        try:
+            if not isinstance(action, dict) or set(action) != {"tool", "rules", "feed_url", "query", "rationale"}:
+                raise ValueError("Invalid scoped setup action")
+            field = ".rationale"
+            required_text(action["rationale"], "Action rationale", 4000)
+            field = ".tool"
+            tool = action["tool"]
+            used = {"rules"} if tool == "update_rules" else {"query"} if tool == "probe_query" else {"feed_url"}
+            if any(action[key] is not None for key in {"rules", "query", "feed_url"} - used):
+                raise ValueError("Scoped action has unsupported fields")
+            if tool == "update_rules":
+                field = ".rules"
+                updated_rules = Rules.parse(action["rules"])
+            elif tool in ("add_feed", "remove_feed"):
+                field = ".feed_url"
+                url = safe_url(action["feed_url"])
+                if tool == "add_feed":
+                    probe_source(url)
+                    if url not in allowed:
+                        raise ValueError("New subscriptions require an existing authorized feed or a successfully executed probe")
+                    desired.add(url)
+                else:
+                    if url not in feeds:
+                        raise ValueError("A setup review can only remove its own feed")
+                    desired.discard(url)
+            elif tool in ("probe_query", "probe_feed"):
+                field = ".query" if tool == "probe_query" else ".feed_url"
+                query = required_text(action["query"], "Probe query", 1000) if tool == "probe_query" else None
+                if query is not None and re.search(r"\b(?:after|before)\s*:", query, re.IGNORECASE):
+                    raise ValueError("Probe query cannot contain after: or before: search operators")
+                url = query_url(query, window) if query is not None else probe_url(action["feed_url"], window)
+                if url in {probe["url"] for probe in probes}:
+                    raise ValueError("Duplicate probe URL")
+                probes.append({"url": url, "query": query})
             else:
-                if url not in feeds:
-                    raise ValueError("A setup review can only remove its own feed")
-                desired.discard(url)
-        elif tool in ("probe_query", "probe_feed"):
-            query = required_text(action["query"], "Probe query", 1000) if tool == "probe_query" else None
-            if query is not None and re.search(r"\b(?:after|before)\s*:", query, re.IGNORECASE):
-                raise ValueError("Probe query cannot contain after: or before: search operators")
-            url = query_url(query, window) if query is not None else probe_url(action["feed_url"], window)
-            if url in {probe["url"] for probe in probes}:
-                raise ValueError("Duplicate probe URL")
-            probes.append({"url": url, "query": query})
-        else:
-            raise ValueError("Unknown scoped setup action")
+                raise ValueError("Unknown scoped setup action")
+        except ValueError as exc:
+            raise Rejected(str(exc), path=f"actions[{index}]{field}", expected="valid scoped setup action", received=action, stage="scoped_validation") from exc
     if not 1 <= len(desired) <= 20:
         raise ValueError("Setup review must retain 1 to 20 subscribed feeds")
     if len(probes) > MAX_PROBES:
         raise ValueError("Setup review supports at most 6 pending probes")
-    subscribed = {probe_source(url) for url in feeds | desired}
+    subscribed = {source_identity(url) for url in feeds | desired}
     for probe in probes:
         probe["independent"] = probe_source(probe["url"]) not in subscribed
     return ScopedPlan(updated_rules, desired, probes)

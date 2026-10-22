@@ -13,7 +13,7 @@ RUN apt-get update \
     && npm cache clean --force
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 CODEX_HOME=/home/node/.codex
 WORKDIR /app
-COPY engine.py model.py setup_review.py server.py ./
+COPY diagnostics.py engine.py model.py setup_review.py server.py ./
 COPY --from=ui-build /app/static/ ./static/
 RUN mkdir -p /data /home/node/.codex \
     && printf 'cli_auth_credentials_store = "file"\n' > /home/node/.codex/config.toml \
